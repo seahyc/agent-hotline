@@ -259,13 +259,14 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     }, async (args) => {
       const id = ensureRegistered();
       const serverUrl = `http://localhost:${opts?.port ?? 3456}`;
+      // Bake all values directly into the command so it works even when
+      // wrapped in subshells (nohup, zsh -c, etc.) by different clients.
+      const authKey = masterKey;
+      const authFlag = authKey ? `-H "Authorization: Bearer ${authKey}"` : "";
+      const inboxUrl = `${serverUrl}/api/inbox/${id}`;
       const cmd = [
-        `AGENT="${id}"`,
-        `SERVER="${serverUrl}"`,
-        `[ -f ~/.agent-hotline/config ] && . ~/.agent-hotline/config`,
-        `hcurl() { if [ -n "$HOTLINE_AUTH_KEY" ]; then curl -H "Authorization: Bearer $HOTLINE_AUTH_KEY" "$@"; else curl "$@"; fi; }`,
         `while true; do`,
-        `  MSGS=$(hcurl -sf "$SERVER/api/inbox/$AGENT" 2>/dev/null)`,
+        `  MSGS=$(curl ${authFlag} -sf "${inboxUrl}" 2>/dev/null)`,
         `  if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ]; then`,
         `    echo "$MSGS" | jq -r '.[] | "[\\(.from_agent)] \\(.content)"' 2>/dev/null`,
         `    exit 0`,
