@@ -62,14 +62,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       const existing = store.getAgent(resolvedId);
       const wasOffline = !existing || !existing.online;
 
-      // If resolved from DB, don't overwrite the hook-registered PID -
-      // the hook's PID (the actual agent process) is the authoritative one.
-      // Only set PID for newly generated agents.
-      if (wasResolved && existing) {
+      // If resolved from DB and the existing PID is still alive, keep it
+      // (the hook's PID is authoritative). Otherwise update with what we have.
+      if (wasResolved && existing && existing.pid && isPidAlive(existing.pid)) {
         store.touchAgent(resolvedId);
-        if (!existing.online) {
-          store.upsertAgent({ session_id: resolvedId, pid: existing.pid });
-        }
       } else {
         store.upsertAgent({
           session_id: resolvedId,
