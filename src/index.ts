@@ -198,7 +198,7 @@ program
   .argument("<tool>", "Tool to configure: claude-code, opencode, codex")
   .option("--agent <name>", "Agent name")
   .option("--server <url>", "Server URL", "http://localhost:3456")
-  .action((tool, opts) => {
+  .action(async (tool, opts) => {
     const supported = ["claude-code", "opencode", "codex"];
     if (!supported.includes(tool)) {
       console.error(
@@ -216,12 +216,17 @@ program
     console.log(`Agent:  ${GREEN}${agent}${RESET}`);
     console.log(`Server: ${serverUrl}`);
     console.log();
-    console.log(
-      `${YELLOW}Setup generators are not yet implemented.${RESET}`,
-    );
-    console.log(
-      `Run ${DIM}agent-hotline setup ${tool} --agent ${agent}${RESET} again after updating.`,
-    );
+
+    if (tool === "claude-code") {
+      const { setupClaudeCode } = await import("./setup/claude-code.js");
+      setupClaudeCode(agent, serverUrl);
+    } else if (tool === "opencode") {
+      const { setupOpenCode } = await import("./setup/opencode.js");
+      setupOpenCode(agent, serverUrl);
+    } else if (tool === "codex") {
+      const { setupCodex } = await import("./setup/codex.js");
+      setupCodex(agent, serverUrl);
+    }
   });
 
 program.parse();
