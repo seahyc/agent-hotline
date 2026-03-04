@@ -2,8 +2,12 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-/** Read HOTLINE_AUTH_KEY from ~/.agent-hotline/config, returns the MCP URL with ?key= if set. */
+/** Returns the MCP URL. For localhost, no key needed (trusted). For remote, appends ?key= from config. */
 export function mcpUrl(serverUrl: string): string {
+  // Localhost is trusted by the server, no key needed
+  if (serverUrl.includes("localhost") || serverUrl.includes("127.0.0.1")) {
+    return `${serverUrl}/mcp`;
+  }
   const configPath = join(homedir(), ".agent-hotline", "config");
   let authKey: string | undefined;
   if (existsSync(configPath)) {
