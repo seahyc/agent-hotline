@@ -326,5 +326,51 @@ export function createServer(store: Store) {
     res.json(agents);
   });
 
+  // POST /api/checkin - register/update an agent via REST
+  app.post("/api/checkin", (req, res) => {
+    const body = req.body;
+    if (!body?.agent_name) {
+      res.status(400).json({ error: "agent_name is required" });
+      return;
+    }
+    store.upsertAgent({
+      agent_name: body.agent_name,
+      agent_type: body.agent_type ?? "",
+      machine: body.machine ?? "",
+      cwd: body.cwd ?? "",
+      cwd_remote: body.cwd_remote ?? "",
+      branch: body.branch ?? "",
+      status: body.status ?? "",
+      dirty_files: body.dirty_files ? JSON.stringify(body.dirty_files) : "[]",
+      background_processes: body.background_processes ? JSON.stringify(body.background_processes) : "[]",
+      git_diff: body.git_diff ?? "",
+      conversation_recent: body.conversation_recent ?? "",
+    });
+    res.json({ ok: true, agent_name: body.agent_name });
+  });
+
+  // POST /api/message - send a message via REST
+  app.post("/api/message", (req, res) => {
+    const { from, to, content } = req.body;
+    if (!from || !to || !content) {
+      res.status(400).json({ error: "from, to, and content are required" });
+      return;
+    }
+    if (to === "*") {
+      const agents = store.getAgents();
+      let count = 0;
+      for (const a of agents) {
+        if (a.agent_name !== from) {
+          store.createMessage(from, a.agent_name, content);
+          count++;
+        }
+      }
+      res.json({ ok: true, broadcast: count });
+    } else {
+      store.createMessage(from, to, content);
+      res.json({ ok: true, to });
+    }
+  });
+
   return { app, getServer, transports };
 }
