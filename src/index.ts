@@ -99,6 +99,9 @@ program
   .option("--db <path>", "Database file path")
   .option("--retention-days <days>", "Auto-delete messages older than N days (0 = keep forever)", "7")
   .action(async (opts) => {
+    const { initLog, log } = await import("./log.js");
+    initLog();
+
     const port = parseInt(opts.port, 10);
     const hubUrl = opts.hub?.replace(/\/+$/, "");
 
@@ -129,6 +132,7 @@ program
       writeFileSync(cfgPath, configLines.filter(Boolean).join("\n") + "\n", "utf-8");
 
       const server = clientApp.listen(port, () => {
+        log("info", `client server started on port ${port}, hub=${hubUrl}`);
         console.log();
         console.log(`${BOLD}${MAGENTA}  Agent Hotline ${YELLOW}(client mode)${RESET}`);
         console.log(`${DIM}  ────────────────────────────${RESET}`);
@@ -156,7 +160,7 @@ program
 
       const store = createStore(dbPath);
       const authKey = opts.authKey ?? readConfig().HOTLINE_AUTH_KEY ?? undefined;
-      const { app, masterKey } = createServer(store, { authKey });
+      const { app, masterKey } = createServer(store, { authKey, port });
       const presence = startPresenceLoop(store, undefined, retentionDays > 0 ? retentionDays : undefined);
 
       // Save auth key to local config so hook.sh picks it up
@@ -170,6 +174,7 @@ program
       writeFileSync(cfgPath, configLines.filter(Boolean).join("\n") + "\n", "utf-8");
 
       const server = app.listen(port, () => {
+        log("info", `hub server started on port ${port}, db=${dbPath}`);
         console.log();
         console.log(`${BOLD}${MAGENTA}  Agent Hotline${RESET}`);
         console.log(`${DIM}  ────────────────────────────${RESET}`);
@@ -180,9 +185,9 @@ program
         console.log(`  ${DIM}Retention${RESET}     ${retentionDays > 0 ? `${retentionDays} days` : "forever"}`);
         console.log(`  ${GREEN}Auth key${RESET}     ${masterKey}${opts.authKey ? "" : " (auto-generated)"}`);
         console.log();
-        const mcpUrlWithKey = `http://localhost:${port}/mcp?key=${masterKey}`;
+        const mcpUrl = `http://localhost:${port}/mcp`;
         console.log(`  ${CYAN}Add to Claude Code:${RESET}`);
-        console.log(`  claude mcp add-json hotline '${JSON.stringify({ type: "url", url: mcpUrlWithKey })}'`);
+        console.log(`  claude mcp add-json hotline '${JSON.stringify({ type: "url", url: mcpUrl })}'`);
         console.log();
         console.log(`  ${DIM}Press Ctrl+C to stop${RESET}`);
         console.log();
@@ -471,7 +476,7 @@ program
       });
       child.unref();
 
-      const localMcpUrl = `http://localhost:${localPort}/mcp?key=${key}`;
+      const localMcpUrl = `http://localhost:${localPort}/mcp`;
 
       console.log();
       console.log(`${BOLD}${GREEN}Connected!${RESET}`);

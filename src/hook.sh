@@ -34,16 +34,19 @@ hotline_curl() {
   fi
 }
 
-# Read stdin JSON (Claude Code passes {"cwd": "..."} on UserPromptSubmit)
+# Read stdin JSON (Claude Code passes {"session_id", "cwd", ...} on UserPromptSubmit)
 STDIN_JSON=""
 if read -t 0.01 -r STDIN_JSON 2>/dev/null; then
   HOOK_CWD=$(echo "$STDIN_JSON" | jq -r '.cwd // empty' 2>/dev/null)
+  HOOK_SESSION=$(echo "$STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null)
 fi
 CWD="${HOOK_CWD:-$(pwd)}"
 
-# Resolve agent name
+# Resolve agent name (priority: explicit config > session_id > tmux > basename)
 if [ -z "$HOTLINE_AGENT" ]; then
-  if [ -n "$TMUX" ]; then
+  if [ -n "$HOOK_SESSION" ]; then
+    HOTLINE_AGENT="$HOOK_SESSION"
+  elif [ -n "$TMUX" ]; then
     HOTLINE_AGENT=$(tmux display-message -p '#S' 2>/dev/null)
   fi
 fi

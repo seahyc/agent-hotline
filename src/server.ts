@@ -5,6 +5,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Store, EventType } from "./store.js";
+import { log } from "./log.js";
 
 /** Deliver an event notification to all subscribers (as inbox messages). */
 function notifySubscribers(store: Store, event: EventType, subjectAgent: string, text: string): void {
@@ -25,7 +26,7 @@ At the START of each session:
 When your status changes, call \`checkin\` again.
 IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.`;
 
-export function createServer(store: Store, opts?: { authKey?: string }) {
+export function createServer(store: Store, opts?: { authKey?: string; port?: number }) {
   // Auth is always enforced. Auto-generate a master key if none provided.
   const masterKey = opts?.authKey ?? store.createApiKey("master-auto");
 
@@ -45,9 +46,9 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
 
     // ── Tool: checkin ──
     mcpServer.registerTool("checkin", {
-      description: "Push your context to the server",
+      description: "Push your context to the server. agent_name defaults to session_id if not provided.",
       inputSchema: {
-        agent_name: z.string(),
+        agent_name: z.string().optional().describe("Display name. Defaults to session_id if omitted."),
         agent_type: z.string().describe("e.g. claude-code, opencode, codex, cursor, windsurf"),
         machine: z.string(),
         cwd: z.string(),
@@ -68,11 +69,18 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
         pid: z.number().optional(),
       },
     }, async (args) => {
-      sessionAgent = args.agent_name;
-      const existing = store.getAgent(args.agent_name);
+      const agentName = args.agent_name || args.session_id;
+      if (!agentName) {
+        return {
+          content: [{ type: "text", text: "Error: agent_name or session_id is required" }],
+          isError: true,
+        };
+      }
+      sessionAgent = agentName;
+      const existing = store.getAgent(agentName);
       const wasOffline = !existing || !existing.online;
       store.upsertAgent({
-        agent_name: args.agent_name,
+        agent_name: agentName,
         agent_type: args.agent_type,
         machine: args.machine,
         cwd: args.cwd,
@@ -88,11 +96,12 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
         pid: args.pid ?? 0,
       });
       if (wasOffline) {
-        notifySubscribers(store, "agent_online", args.agent_name,
-          `${args.agent_name} is now online (${args.machine}, ${args.cwd})`);
+        log("info", `mcp checkin ${agentName} (${args.machine}, ${args.cwd}) - came online`);
+        notifySubscribers(store, "agent_online", agentName,
+          `${agentName} is now online (${args.machine}, ${args.cwd})`);
       }
       return {
-        content: [{ type: "text", text: `Checked in as ${args.agent_name}` }],
+        content: [{ type: "text", text: `Checked in as ${agentName}` }],
       };
     });
 
@@ -154,11 +163,13 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
             count++;
           }
         }
+        log("info", `mcp broadcast from ${args.from} to ${count} agents`);
         return {
           content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
         };
       }
       store.createMessage(args.from, args.to, args.content);
+      log("info", `mcp message ${args.from} -> ${args.to}`);
       return {
         content: [{ type: "text", text: `Message sent to ${args.to}` }],
       };
@@ -229,7 +240,7 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
           isError: true,
         };
       }
-      const serverUrl = "http://localhost:3456";
+      const serverUrl = `http://localhost:${opts?.port ?? 3456}`;
       const cmd = [
         `AGENT="${sessionAgent}"`,
         `SERVER="${serverUrl}"`,
@@ -265,6 +276,7 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
           isError: true,
         };
       }
+      log("info", `mcp checkout ${sessionAgent} - went offline`);
       store.markOffline(sessionAgent);
       notifySubscribers(store, "agent_offline", sessionAgent,
         `${sessionAgent} went offline`);
@@ -377,6 +389,7 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
     const key = bearer || queryKey;
 
     if (!key || !store.validateApiKey(key)) {
+      log("warn", `auth rejected ${req.method} ${req.path} from ${ip}`);
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -522,6 +535,7 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
       pid: body.pid ?? 0,
     });
     if (wasOffline) {
+      log("info", `checkin ${body.agent_name} (${body.machine ?? "unknown"}, ${body.cwd ?? ""}) - came online`);
       notifySubscribers(store, "agent_online", body.agent_name,
         `${body.agent_name} is now online (${body.machine ?? "unknown"}, ${body.cwd ?? ""})`);
     }
@@ -535,6 +549,7 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
       res.status(400).json({ error: "agent_name is required" });
       return;
     }
+    log("info", `checkout ${agent_name} - went offline`);
     store.markOffline(agent_name);
     notifySubscribers(store, "agent_offline", agent_name, `${agent_name} went offline`);
     res.json({ ok: true, agent_name });
@@ -590,9 +605,11 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
           count++;
         }
       }
+      log("info", `message broadcast from ${from} to ${count} agents`);
       res.json({ ok: true, broadcast: count });
     } else {
       store.createMessage(from, to, content);
+      log("info", `message ${from} -> ${to}`);
       res.json({ ok: true, to });
     }
   });
