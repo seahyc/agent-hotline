@@ -8,6 +8,7 @@ import type { Store, EventType } from "./store.js";
 import { log } from "./log.js";
 import { getClientPid } from "./pid.js";
 import { resolveSessionId } from "./identity.js";
+import { resolveContext, isPidAlive } from "./context.js";
 
 /** Deliver an event notification to all subscribers (as inbox messages). */
 function notifySubscribers(store: Store, event: EventType, subjectAgent: string, text: string): void {
@@ -20,12 +21,11 @@ function notifySubscribers(store: Store, event: EventType, subjectAgent: string,
 }
 
 const INSTRUCTIONS = `Agent Hotline - Cross-machine agent communication.
+Your identity and context are auto-resolved from your connection.
 At the START of each session:
-1. Call \`checkin\` with your status, cwd, branch, files, and background processes. Your identity is resolved automatically from your connection - no session_id needed.
-2. Call \`who\` to see other online agents.
-3. Call \`inbox\` to read unread messages.
-4. Call \`listen\` and run the returned command in background to receive messages in real-time.
-When your status changes, call \`checkin\` again.
+1. Call \`who\` to see other online agents.
+2. Call \`inbox\` to read unread messages.
+3. Call \`listen\` and run the returned command in background to receive messages in real-time.
 IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.`;
 
 export function createServer(store: Store, opts?: { authKey?: string; port?: number }) {
@@ -41,104 +41,119 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
   const getServer = (clientPid?: number | null) => {
     let sessionAgent: string | null = null;
 
-    const mcpServer = new McpServer(
-      { name: "hotline", version: "0.1.0" },
-      { instructions: INSTRUCTIONS },
-    );
+    /** Auto-register this agent on first tool call. */
+    const ensureRegistered = (): string => {
+      if (sessionAgent) return sessionAgent;
 
-    // ── Tool: checkin ──
-    mcpServer.registerTool("checkin", {
-      description: "Push your context to the server. Identity is auto-resolved from your connection - no session_id needed. Pass session_id explicitly to override.",
-      inputSchema: {
-        session_id: z.string().optional().describe("Override auto-resolved identity. Usually not needed."),
-        agent_type: z.string().describe("e.g. claude-code, opencode, codex, cursor, windsurf"),
-        machine: z.string(),
-        cwd: z.string(),
-        cwd_remote: z.string().optional(),
-        branch: z.string(),
-        status: z.string(),
-        dirty_files: z.array(z.string()).optional(),
-        background_processes: z.array(z.object({
-          pid: z.number(),
-          port: z.number().optional(),
-          command: z.string(),
-          description: z.string(),
-        })).optional(),
-        git_diff: z.string().optional(),
-        conversation_recent: z.string().optional(),
-        terminal: z.string().optional(),
-        pid: z.number().optional(),
-      },
-    }, async (args) => {
-      // Resolve session_id: explicit > re-checkin > PID auto-bind > auto-generate
-      let resolvedId = args.session_id;
-      if (!resolvedId && sessionAgent) {
-        resolvedId = sessionAgent;
-      }
-      if (!resolvedId && clientPid) {
+      // Resolve identity: PID-based > auto-generate
+      let resolvedId: string | undefined;
+      if (clientPid) {
         resolvedId = resolveSessionId(clientPid, store) ?? undefined;
       }
       if (!resolvedId) {
         resolvedId = randomUUID();
-        log("info", `mcp checkin auto-generated session_id: ${resolvedId}`);
+        log("info", `auto-register generated session_id: ${resolvedId}`);
       }
 
       sessionAgent = resolvedId;
       const existing = store.getAgent(resolvedId);
       const wasOffline = !existing || !existing.online;
+
+      // Minimal upsert - context is pulled on demand via resolveContext
       store.upsertAgent({
         session_id: resolvedId,
-        agent_type: args.agent_type,
-        machine: args.machine,
-        cwd: args.cwd,
-        cwd_remote: args.cwd_remote ?? "",
-        branch: args.branch,
-        status: args.status,
-        dirty_files: args.dirty_files ? JSON.stringify(args.dirty_files) : "[]",
-        background_processes: args.background_processes ? JSON.stringify(args.background_processes) : "[]",
-        git_diff: args.git_diff ?? "",
-        conversation_recent: args.conversation_recent ?? "",
-        terminal: args.terminal ?? "",
-        pid: args.pid ?? clientPid ?? 0,
+        pid: clientPid ?? 0,
       });
+
       if (wasOffline) {
-        log("info", `mcp checkin ${resolvedId} (${args.machine}, ${args.cwd}) - came online`);
+        log("info", `auto-register ${resolvedId} (PID ${clientPid}) - came online`);
         notifySubscribers(store, "agent_online", resolvedId,
-          `${resolvedId} is now online (${args.machine}, ${args.cwd})`);
+          `${resolvedId} is now online`);
       }
-      return {
-        content: [{ type: "text", text: `Checked in as ${resolvedId}` }],
-      };
-    });
+
+      return resolvedId;
+    };
+
+    const mcpServer = new McpServer(
+      { name: "hotline", version: "0.1.0" },
+      { instructions: INSTRUCTIONS },
+    );
 
     // ── Tool: who ──
     mcpServer.registerTool("who", {
-      description: "See agents. Defaults to online only. Set `all: true` to include offline agents. Optionally filter by `cwd_filter` (substring matched against agents' cwd).",
+      description: "See online agents. Filters: `repo` (substring match on git remote URL), `branch` (exact match), `cwd` (substring match on working directory). Set `all: true` to include offline agents.",
       inputSchema: {
-        cwd_filter: z.string().optional(),
+        repo: z.string().optional().describe("Filter by git remote URL (substring match, e.g. 'agent-hotline' or 'github.com:user/repo')"),
+        branch: z.string().optional().describe("Filter by git branch (exact match)"),
+        cwd: z.string().optional().describe("Filter by working directory (substring match)"),
         all: z.boolean().optional().default(false),
       },
     }, async (args) => {
-      let agents = args.all ? store.getAgents(args.cwd_filter) : store.getOnlineAgents();
-      if (!args.all && args.cwd_filter) {
-        const filter = args.cwd_filter.toLowerCase();
-        agents = agents.filter((a) => a.cwd.toLowerCase().includes(filter));
+      ensureRegistered();
+      let agents = args.all ? store.getAgents() : store.getOnlineAgents();
+
+      // Auto-prune: mark agents with dead PIDs as offline
+      agents = agents.filter((a) => {
+        if (a.online && a.pid && !isPidAlive(a.pid)) {
+          log("info", `auto-prune: PID ${a.pid} (${a.session_id}) is dead, marking offline`);
+          store.markOffline(a.session_id);
+          notifySubscribers(store, "agent_offline", a.session_id, `${a.session_id} went offline (process exited)`);
+          if (args.all) {
+            a.online = 0;
+            return true;
+          }
+          return false;
+        }
+        return true;
+      });
+
+      // Resolve live context once per agent, then filter
+      const enriched = agents.map((a) => {
+        const live = a.pid && a.online ? resolveContext(a.pid, a.session_id) : null;
+        return { agent: a, live };
+      });
+
+      let filtered = enriched;
+
+      if (args.cwd) {
+        const f = args.cwd.toLowerCase();
+        filtered = filtered.filter(({ agent: a, live }) => {
+          const cwd = live?.cwd || a.cwd || "";
+          return cwd.toLowerCase().includes(f);
+        });
       }
-      const list = agents.map((a) => ({
-        id: a.session_id,
-        type: a.agent_type,
-        machine: a.machine,
-        cwd: a.cwd,
-        cwd_remote: a.cwd_remote,
-        branch: a.branch,
-        status: a.status,
-        dirty_files: JSON.parse(a.dirty_files || "[]"),
-        background_processes: JSON.parse(a.background_processes || "[]"),
-        terminal: a.terminal || undefined,
-        pid: a.pid || undefined,
-        last_seen: a.last_seen,
-        online: a.online,
-      }));
+
+      if (args.repo) {
+        const f = args.repo.toLowerCase();
+        filtered = filtered.filter(({ agent: a, live }) => {
+          const remote = live?.cwd_remote || a.cwd_remote || "";
+          return remote.toLowerCase().includes(f);
+        });
+      }
+
+      if (args.branch) {
+        filtered = filtered.filter(({ agent: a, live }) => {
+          const branch = live?.branch || a.branch || "";
+          return branch === args.branch;
+        });
+      }
+
+      const list = filtered.map(({ agent: a, live }) => {
+        return {
+          id: a.session_id,
+          type: live?.agent_type || a.agent_type || undefined,
+          machine: live?.machine || a.machine || undefined,
+          cwd: live?.cwd || a.cwd || undefined,
+          cwd_remote: live?.cwd_remote || a.cwd_remote || undefined,
+          branch: live?.branch || a.branch || undefined,
+          dirty_files: live?.dirty_files ?? JSON.parse(a.dirty_files || "[]"),
+          background_processes: live?.background_processes ?? JSON.parse(a.background_processes || "[]"),
+          pid: a.pid || undefined,
+          unread: store.getUnreadMessages(a.session_id).length || undefined,
+          last_seen: a.last_seen,
+          online: a.online,
+        };
+      });
       return {
         content: [{ type: "text", text: JSON.stringify(list, null, 2) }],
       };
@@ -146,34 +161,29 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
     // ── Tool: message ──
     mcpServer.registerTool("message", {
-      description: "Send a message to another agent (or '*' to broadcast to all online agents). Must checkin first.",
+      description: "Send a message to another agent (or '*' to broadcast to all online agents).",
       inputSchema: {
         to: z.string(),
         content: z.string(),
       },
     }, async (args) => {
-      if (!sessionAgent) {
-        return {
-          content: [{ type: "text", text: "Error: Call checkin first" }],
-          isError: true,
-        };
-      }
+      const id = ensureRegistered();
       if (args.to === "*") {
         const agents = store.getOnlineAgents();
         let count = 0;
         for (const a of agents) {
-          if (a.session_id !== sessionAgent) {
-            store.createMessage(sessionAgent, a.session_id, args.content);
+          if (a.session_id !== id) {
+            store.createMessage(id, a.session_id, args.content);
             count++;
           }
         }
-        log("info", `mcp broadcast from ${sessionAgent} to ${count} agents`);
+        log("info", `mcp broadcast from ${id} to ${count} agents`);
         return {
           content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
         };
       }
-      store.createMessage(sessionAgent, args.to, args.content);
-      log("info", `mcp message ${sessionAgent} -> ${args.to}`);
+      store.createMessage(id, args.to, args.content);
+      log("info", `mcp message ${id} -> ${args.to}`);
       return {
         content: [{ type: "text", text: `Message sent to ${args.to}` }],
       };
@@ -181,56 +191,55 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
     // ── Tool: inbox ──
     mcpServer.registerTool("inbox", {
-      description: "Read your unread messages (must checkin first)",
+      description: "Read your messages. Defaults to unread only. Use `status: 'all'` to see all messages, or `status: 'read'` for read-only.",
       inputSchema: {
-        mark_read: z.boolean().optional().default(true),
+        status: z.enum(["unread", "read", "all"]).optional().default("unread").describe("Filter by read status"),
+        limit: z.number().optional().default(20).describe("Max messages to return (newest first for read/all)"),
+        before: z.string().optional().describe("ISO timestamp cursor - fetch messages older than this (for pagination)"),
+        mark_read: z.boolean().optional().default(true).describe("Mark returned unread messages as read"),
       },
     }, async (args) => {
-      if (!sessionAgent) {
-        return {
-          content: [{ type: "text", text: "Error: Call checkin first" }],
-          isError: true,
-        };
-      }
-      const messages = store.getUnreadMessages(sessionAgent);
-      if (args.mark_read) {
-        store.markRead(sessionAgent);
-      }
-      return {
-        content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
-      };
-    });
+      const id = ensureRegistered();
+      let messages: { from_agent: string; content: string; timestamp: number; read: number }[];
 
-    // ── Tool: subscribe ──
-    mcpServer.registerTool("subscribe", {
-      description: "Manage your event subscriptions (must checkin first). Events: agent_online, agent_offline. Subscribed events appear as system messages in your inbox.",
-      inputSchema: {
-        add: z.array(z.enum(["agent_online", "agent_offline"])).optional(),
-        remove: z.array(z.enum(["agent_online", "agent_offline"])).optional(),
-      },
-    }, async (args) => {
-      if (!sessionAgent) {
-        return {
-          content: [{ type: "text", text: "Error: Call checkin first" }],
-          isError: true,
-        };
+      const beforeTs = args.before ? new Date(args.before).getTime() : undefined;
+
+      if (args.status === "unread") {
+        messages = store.getUnreadMessages(id);
+        if (beforeTs) {
+          messages = messages.filter((m) => m.timestamp < beforeTs);
+        }
+        if (messages.length > args.limit) {
+          messages = messages.slice(0, args.limit);
+        }
+      } else {
+        const all = store.getMessages(id, args.limit, beforeTs);
+        if (args.status === "read") {
+          messages = all.filter((m) => m.read === 1);
+        } else {
+          messages = all;
+        }
       }
-      if (args.add?.length) {
-        store.subscribe(sessionAgent, args.add);
+
+      if (args.mark_read && args.status !== "read") {
+        store.markRead(id);
       }
-      if (args.remove?.length) {
-        store.unsubscribe(sessionAgent, args.remove);
-      }
-      const current = store.getSubscriptions(sessionAgent);
+
+      const trimmed = messages.map((m) => ({
+        from: m.from_agent,
+        content: m.content,
+        time: new Date(m.timestamp).toISOString(),
+        ...(args.status !== "unread" ? { read: !!m.read } : {}),
+      }));
       return {
-        content: [{ type: "text", text: `Subscriptions for ${sessionAgent}: ${current.length ? current.join(", ") : "none"}` }],
+        content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
       };
     });
 
     // ── Tool: listen ──
     mcpServer.registerTool("listen", {
       description: [
-        "Get a background polling command that watches your inbox and exits when a message arrives (must checkin first).",
+        "Get a background polling command that watches your inbox and exits when a message arrives.",
         "Run the returned command as a background process. When it exits, you will be woken up with the message.",
         "IMPORTANT: After processing the message, call `listen` again to resume monitoring.",
       ].join(" "),
@@ -238,15 +247,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         poll_interval: z.number().optional().default(3),
       },
     }, async (args) => {
-      if (!sessionAgent) {
-        return {
-          content: [{ type: "text", text: "Error: Call checkin first" }],
-          isError: true,
-        };
-      }
+      const id = ensureRegistered();
       const serverUrl = `http://localhost:${opts?.port ?? 3456}`;
       const cmd = [
-        `AGENT="${sessionAgent}"`,
+        `AGENT="${id}"`,
         `SERVER="${serverUrl}"`,
         `PIDFILE=~/.agent-hotline/poller-$AGENT.pid`,
         `[ -f ~/.agent-hotline/config ] && . ~/.agent-hotline/config`,
@@ -266,26 +270,6 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       ].join("; ");
       return {
         content: [{ type: "text", text: `Run this command in the background to listen for messages:\n\n${cmd}\n\nWhen this exits with a message, process it and call \`listen\` again to resume.` }],
-      };
-    });
-
-    // ── Tool: checkout ──
-    mcpServer.registerTool("checkout", {
-      description: "Mark yourself as offline (call before exiting)",
-      inputSchema: {},
-    }, async () => {
-      if (!sessionAgent) {
-        return {
-          content: [{ type: "text", text: "Error: Call checkin first" }],
-          isError: true,
-        };
-      }
-      log("info", `mcp checkout ${sessionAgent} - went offline`);
-      store.markOffline(sessionAgent);
-      notifySubscribers(store, "agent_offline", sessionAgent,
-        `${sessionAgent} went offline`);
-      return {
-        content: [{ type: "text", text: `${sessionAgent} checked out` }],
       };
     });
 
@@ -312,40 +296,6 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
           contents: [{
             uri: `hotline://agent/${name}/status`,
             text: agent ? JSON.stringify(agent, null, 2) : JSON.stringify({ error: "Agent not found" }),
-          }],
-        };
-      },
-    );
-
-    // ── Resource template: hotline://agent/{name}/diff ──
-    mcpServer.registerResource(
-      "agent-diff",
-      new ResourceTemplate("hotline://agent/{name}/diff", { list: undefined }),
-      { description: "Agent's git diff", mimeType: "text/plain" },
-      async (_uri, vars) => {
-        const name = vars.name as string;
-        const agent = store.getAgent(name);
-        return {
-          contents: [{
-            uri: `hotline://agent/${name}/diff`,
-            text: agent?.git_diff ?? "",
-          }],
-        };
-      },
-    );
-
-    // ── Resource template: hotline://agent/{name}/conversation ──
-    mcpServer.registerResource(
-      "agent-conversation",
-      new ResourceTemplate("hotline://agent/{name}/conversation", { list: undefined }),
-      { description: "Agent's recent conversation", mimeType: "text/plain" },
-      async (_uri, vars) => {
-        const name = vars.name as string;
-        const agent = store.getAgent(name);
-        return {
-          contents: [{
-            uri: `hotline://agent/${name}/conversation`,
-            text: agent?.conversation_recent ?? "",
           }],
         };
       },
@@ -517,8 +467,8 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     res.json(agents);
   });
 
-  // POST /api/checkin - register/update an agent via REST
-  app.post("/api/checkin", (req, res) => {
+  // POST /api/heartbeat - lightweight presence signal (session_id + pid). Context is pulled on demand.
+  const heartbeatHandler: express.RequestHandler = (req, res) => {
     const body = req.body;
     if (!body?.session_id) {
       res.status(400).json({ error: "session_id is required" });
@@ -528,39 +478,17 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     const wasOffline = !existing || !existing.online;
     store.upsertAgent({
       session_id: body.session_id,
-      agent_type: body.agent_type ?? "",
-      machine: body.machine ?? "",
-      cwd: body.cwd ?? "",
-      cwd_remote: body.cwd_remote ?? "",
-      branch: body.branch ?? "",
-      status: body.status ?? "",
-      dirty_files: body.dirty_files ? JSON.stringify(body.dirty_files) : "[]",
-      background_processes: body.background_processes ? JSON.stringify(body.background_processes) : "[]",
-      git_diff: body.git_diff ?? "",
-      conversation_recent: body.conversation_recent ?? "",
-      terminal: body.terminal ?? "",
       pid: body.pid ?? 0,
     });
     if (wasOffline) {
-      log("info", `checkin ${body.session_id} (${body.machine ?? "unknown"}, ${body.cwd ?? ""}) - came online`);
+      log("info", `heartbeat ${body.session_id} (PID ${body.pid ?? 0}) - came online`);
       notifySubscribers(store, "agent_online", body.session_id,
-        `${body.session_id} is now online (${body.machine ?? "unknown"}, ${body.cwd ?? ""})`);
+        `${body.session_id} is now online`);
     }
     res.json({ ok: true, session_id: body.session_id });
-  });
-
-  // POST /api/checkout - mark agent offline via REST
-  app.post("/api/checkout", (req, res) => {
-    const { session_id } = req.body;
-    if (!session_id) {
-      res.status(400).json({ error: "session_id is required" });
-      return;
-    }
-    log("info", `checkout ${session_id} - went offline`);
-    store.markOffline(session_id);
-    notifySubscribers(store, "agent_offline", session_id, `${session_id} went offline`);
-    res.json({ ok: true, session_id });
-  });
+  };
+  app.post("/api/heartbeat", heartbeatHandler);
+  app.post("/api/checkin", heartbeatHandler); // backward compat alias
 
   // POST /api/invite - generate an invite code (requires master key)
   app.post("/api/invite", (req, res) => {

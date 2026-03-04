@@ -18,14 +18,8 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
   const app = express();
   const pidMap = new Map<string, number>(); // session_id -> pid
 
-  // Parse JSON bodies for intercepting checkin/checkout
+  // Parse JSON bodies for intercepting heartbeat
   app.use(express.json({ limit: "10mb" }));
-
-  // Rebuild raw body for proxying (needed for non-JSON or to forward exact bytes)
-  app.use((req, _res, next) => {
-    // Body already parsed by express.json; store it for re-serialization
-    next();
-  });
 
   const hubHeaders = (extra?: Record<string, string | undefined>): Record<string, string> => {
     const h: Record<string, string> = { Authorization: `Bearer ${authKey}` };
@@ -47,14 +41,14 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
     });
   });
 
-  // ── Intercept checkin to track PIDs ──
-  app.post("/api/checkin", async (req, res) => {
+  // ── Intercept heartbeat to track PIDs locally ──
+  app.post("/api/heartbeat", async (req, res) => {
     const body = req.body;
     if (body?.session_id && body?.pid) {
       pidMap.set(body.session_id, body.pid);
     }
     try {
-      const upstream = await fetch(`${hubUrl}/api/checkin`, {
+      const upstream = await fetch(`${hubUrl}/api/heartbeat`, {
         method: "POST",
         headers: hubHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
@@ -65,24 +59,10 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
       res.status(502).json({ error: "Hub unreachable", detail: String(e) });
     }
   });
-
-  // ── Intercept checkout to untrack PIDs ──
-  app.post("/api/checkout", async (req, res) => {
-    const body = req.body;
-    if (body?.session_id) {
-      pidMap.delete(body.session_id);
-    }
-    try {
-      const upstream = await fetch(`${hubUrl}/api/checkout`, {
-        method: "POST",
-        headers: hubHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify(body),
-      });
-      const data = await upstream.json();
-      res.status(upstream.status).json(data);
-    } catch (e) {
-      res.status(502).json({ error: "Hub unreachable", detail: String(e) });
-    }
+  // Backward compat alias
+  app.post("/api/checkin", (req, res, next) => {
+    req.url = "/api/heartbeat";
+    next("route");
   });
 
   // ── MCP proxy (POST, GET, DELETE) ──
@@ -166,21 +146,12 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
     }
   });
 
-  // ── PID monitor: check every 10s ──
-  const pidCheckTimer = setInterval(async () => {
+  // ── PID monitor: check every 10s, remove dead PIDs from local tracking ──
+  // Hub-side cleanup happens via who's auto-prune (checks PID liveness)
+  const pidCheckTimer = setInterval(() => {
     for (const [sessionId, pid] of pidMap) {
       if (!isProcessAlive(pid)) {
         pidMap.delete(sessionId);
-        // Notify hub that agent is offline
-        try {
-          await fetch(`${hubUrl}/api/checkout`, {
-            method: "POST",
-            headers: hubHeaders({ "Content-Type": "application/json" }),
-            body: JSON.stringify({ session_id: sessionId }),
-          });
-        } catch {
-          // Hub unreachable, will retry or hub's own presence will catch it
-        }
       }
     }
   }, PID_CHECK_INTERVAL_MS);

@@ -38,12 +38,10 @@ export interface Store {
   getAgentByPid(pid: number): Agent | null;
   createMessage(from: string, to: string, content: string): void;
   getUnreadMessages(sessionId: string): Message[];
+  getMessages(sessionId: string, limit: number, before?: number): Message[];
   markRead(sessionId: string): void;
   markOffline(sessionId: string): void;
   getOnlineAgents(): Agent[];
-  subscribe(sessionId: string, events: EventType[]): void;
-  unsubscribe(sessionId: string, events: EventType[]): void;
-  getSubscriptions(sessionId: string): EventType[];
   getSubscribers(event: EventType): string[];
   purgeOldMessages(maxAgeDays: number): number;
   touchAgent(sessionId: string): void;
@@ -159,6 +157,12 @@ export function createStore(dbPath?: string): Store {
   const getUnreadMessagesStmt = db.prepare(
     "SELECT * FROM messages WHERE to_agent = ? AND read = 0 ORDER BY timestamp ASC",
   );
+  const getMessagesStmt = db.prepare(
+    "SELECT * FROM messages WHERE to_agent = ? ORDER BY timestamp DESC LIMIT ?",
+  );
+  const getMessagesBeforeStmt = db.prepare(
+    "SELECT * FROM messages WHERE to_agent = ? AND timestamp < ? ORDER BY timestamp DESC LIMIT ?",
+  );
   const markReadStmt = db.prepare(
     "UPDATE messages SET read = 1 WHERE to_agent = ? AND read = 0",
   );
@@ -170,15 +174,6 @@ export function createStore(dbPath?: string): Store {
   );
   const touchAgentStmt = db.prepare(
     "UPDATE agents SET last_seen = ? WHERE session_id = ?",
-  );
-  const subscribeStmt = db.prepare(
-    "INSERT OR IGNORE INTO subscriptions (session_id, event) VALUES (?, ?)",
-  );
-  const unsubscribeStmt = db.prepare(
-    "DELETE FROM subscriptions WHERE session_id = ? AND event = ?",
-  );
-  const getSubscriptionsStmt = db.prepare(
-    "SELECT event FROM subscriptions WHERE session_id = ?",
   );
   const getSubscribersStmt = db.prepare(
     "SELECT session_id FROM subscriptions WHERE event = ?",
@@ -252,6 +247,13 @@ export function createStore(dbPath?: string): Store {
       return getUnreadMessagesStmt.all(sessionId) as Message[];
     },
 
+    getMessages(sessionId, limit, before?) {
+      if (before) {
+        return getMessagesBeforeStmt.all(sessionId, before, limit) as Message[];
+      }
+      return getMessagesStmt.all(sessionId, limit) as Message[];
+    },
+
     markRead(sessionId) {
       markReadStmt.run(sessionId);
     },
@@ -262,23 +264,6 @@ export function createStore(dbPath?: string): Store {
 
     getOnlineAgents() {
       return getOnlineAgentsStmt.all() as Agent[];
-    },
-
-    subscribe(sessionId, events) {
-      for (const event of events) {
-        subscribeStmt.run(sessionId, event);
-      }
-    },
-
-    unsubscribe(sessionId, events) {
-      for (const event of events) {
-        unsubscribeStmt.run(sessionId, event);
-      }
-    },
-
-    getSubscriptions(sessionId) {
-      const rows = getSubscriptionsStmt.all(sessionId) as { event: string }[];
-      return rows.map((r) => r.event as EventType);
     },
 
     getSubscribers(event) {

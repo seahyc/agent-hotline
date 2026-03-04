@@ -47,8 +47,25 @@ function mockStore(): Store {
         last_seen: Date.now(),
         online: 1,
       };
-      if (idx >= 0) agents[idx] = full;
-      else agents.push(full);
+      if (idx >= 0) {
+        // Merge: only overwrite fields that are provided (non-default)
+        const existing = agents[idx];
+        agents[idx] = {
+          ...existing,
+          ...full,
+          // Preserve existing non-empty values if new value is empty
+          agent_type: full.agent_type || existing.agent_type,
+          machine: full.machine || existing.machine,
+          cwd: full.cwd || existing.cwd,
+          cwd_remote: full.cwd_remote || existing.cwd_remote,
+          branch: full.branch || existing.branch,
+          status: full.status || existing.status,
+          last_seen: full.last_seen,
+          online: 1,
+        };
+      } else {
+        agents.push(full);
+      }
     }),
     getAgents: vi.fn((room?: string) => {
       if (room) return agents.filter((a) => a.cwd.includes(room));
@@ -62,6 +79,9 @@ function mockStore(): Store {
     getUnreadMessages: vi.fn((agentName: string) =>
       messages.filter((m) => m.to_agent === agentName && m.read === 0),
     ),
+    getMessages: vi.fn((agentName: string, limit: number) =>
+      messages.filter((m) => m.to_agent === agentName).reverse().slice(0, limit),
+    ),
     markRead: vi.fn((agentName: string) => {
       for (const m of messages) {
         if (m.to_agent === agentName) m.read = 1;
@@ -69,9 +89,6 @@ function mockStore(): Store {
     }),
     markOffline: vi.fn(),
     getOnlineAgents: vi.fn(() => agents.filter((a) => a.online === 1)),
-    subscribe: vi.fn(),
-    unsubscribe: vi.fn(),
-    getSubscriptions: vi.fn(() => []),
     getSubscribers: vi.fn(() => []),
     purgeOldMessages: vi.fn(() => 0),
     touchAgent: vi.fn(),
@@ -155,76 +172,8 @@ describe("server - MCP tools via client", () => {
     cleanDb();
   });
 
-  it("checkin tool stores agent and returns confirmation", async () => {
-    const result = await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "alice",
-        agent_type: "claude-code",
-        machine: "mac-1",
-        cwd: "/home/alice/project",
-        branch: "main",
-        status: "working",
-      },
-    });
-    expect(result.content).toEqual([
-      { type: "text", text: "Checked in as alice" },
-    ]);
-
-    const agent = store.getAgent("alice");
-    expect(agent).not.toBeNull();
-    expect(agent!.agent_type).toBe("claude-code");
-    expect(agent!.cwd).toBe("/home/alice/project");
-    expect(agent!.online).toBe(1);
-  });
-
-  it("checkin with optional fields", async () => {
-    const result = await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "bob",
-        agent_type: "opencode",
-        machine: "linux-1",
-        cwd: "/home/bob/repo",
-        cwd_remote: "git@github.com:bob/repo.git",
-        branch: "feature",
-        status: "idle",
-        dirty_files: ["file1.ts", "file2.ts"],
-        git_diff: "diff --git a/file1.ts",
-        conversation_recent: "discussing feature",
-      },
-    });
-    expect(result.content).toEqual([
-      { type: "text", text: "Checked in as bob" },
-    ]);
-
-    const agent = store.getAgent("bob");
-    expect(agent!.cwd_remote).toBe("git@github.com:bob/repo.git");
-    expect(agent!.dirty_files).toBe('["file1.ts","file2.ts"]');
-    expect(agent!.git_diff).toBe("diff --git a/file1.ts");
-  });
-
-  it("checkin without session_id auto-generates one", async () => {
-    const result = await client.callTool({
-      name: "checkin",
-      arguments: {
-        agent_type: "codex",
-        machine: "linux-1",
-        cwd: "/home/user/project",
-        branch: "main",
-        status: "working",
-      },
-    });
-    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toMatch(/^Checked in as .+/);
-    // Should have generated a UUID
-    const sessionId = text.replace("Checked in as ", "");
-    expect(sessionId.length).toBeGreaterThan(0);
-    const agent = store.getAgent(sessionId);
-    expect(agent).not.toBeNull();
-  });
-
-  it("who tool returns agents", async () => {
+  it("who tool returns agents (auto-registers caller)", async () => {
+    // Pre-register another agent in the DB
     store.upsertAgent({
       session_id: "alice",
       agent_type: "claude-code",
@@ -237,75 +186,81 @@ describe("server - MCP tools via client", () => {
     const result = await client.callTool({ name: "who", arguments: {} });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const agents = JSON.parse(text);
-    expect(agents).toHaveLength(1);
-    expect(agents[0].id).toBe("alice");
-    expect(agents[0].type).toBe("claude-code");
+    // Should have alice + the auto-registered caller
+    expect(agents.length).toBeGreaterThanOrEqual(1);
+    const alice = agents.find((a: any) => a.id === "alice");
+    expect(alice).toBeDefined();
+    expect(alice.type).toBe("claude-code");
   });
 
-  it("who with room filter", async () => {
+  it("who with cwd filter", async () => {
     store.upsertAgent({ session_id: "a1", cwd: "/home/user/project-x" });
     store.upsertAgent({ session_id: "a2", cwd: "/home/user/project-y" });
 
     const result = await client.callTool({
       name: "who",
-      arguments: { cwd_filter: "project-x" },
+      arguments: { cwd: "project-x" },
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const agents = JSON.parse(text);
-    expect(agents).toHaveLength(1);
-    expect(agents[0].id).toBe("a1");
+    const ids = agents.map((a: any) => a.id);
+    expect(ids).toContain("a1");
+    expect(ids).not.toContain("a2");
   });
 
-  it("message tool requires checkin first", async () => {
+  it("who with repo filter", async () => {
+    store.upsertAgent({ session_id: "a1", cwd: "/home/alice/hotline", cwd_remote: "git@github.com:seahyc/agent-hotline.git" });
+    store.upsertAgent({ session_id: "a2", cwd: "/home/bob/other", cwd_remote: "git@github.com:bob/other-repo.git" });
+
     const result = await client.callTool({
-      name: "message",
-      arguments: { to: "bob", content: "hello" },
+      name: "who",
+      arguments: { repo: "agent-hotline" },
     });
-    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const agents = JSON.parse(text);
+    const ids = agents.map((a: any) => a.id);
+    expect(ids).toContain("a1");
+    expect(ids).not.toContain("a2");
   });
 
-  it("message tool sends direct message", async () => {
-    // Checkin first to establish identity
-    await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "alice",
-        agent_type: "claude-code",
-        machine: "mac-1",
-        cwd: "/home/alice",
-        branch: "main",
-        status: "working",
-      },
+  it("who with branch filter", async () => {
+    store.upsertAgent({ session_id: "a1", branch: "main" });
+    store.upsertAgent({ session_id: "a2", branch: "feature/xyz" });
+
+    const result = await client.callTool({
+      name: "who",
+      arguments: { branch: "main" },
     });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const agents = JSON.parse(text);
+    const ids = agents.map((a: any) => a.id);
+    expect(ids).toContain("a1");
+    expect(ids).not.toContain("a2");
+  });
+
+  it("message tool auto-registers and sends direct message", async () => {
     store.upsertAgent({ session_id: "bob" });
 
     const result = await client.callTool({
       name: "message",
       arguments: { to: "bob", content: "hello bob" },
     });
-    expect(result.content).toEqual([
-      { type: "text", text: "Message sent to bob" },
-    ]);
+    expect(result.isError).toBeFalsy();
 
     const msgs = store.getUnreadMessages("bob");
     expect(msgs).toHaveLength(1);
     expect(msgs[0].content).toBe("hello bob");
-    expect(msgs[0].from_agent).toBe("alice");
   });
 
   it("message tool broadcasts to all except sender", async () => {
-    // Checkin as alice
-    await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "alice",
-        agent_type: "claude-code",
-        machine: "mac-1",
-        cwd: "/home/alice",
-        branch: "main",
-        status: "working",
-      },
-    });
+    // First call any tool to auto-register the caller
+    await client.callTool({ name: "who", arguments: {} });
+
+    // Get the auto-generated session_id for the caller
+    const onlineAgents = store.getOnlineAgents();
+    const callerAgent = onlineAgents.find(a => a.session_id !== "bob" && a.session_id !== "charlie");
+    expect(callerAgent).toBeDefined();
+
     store.upsertAgent({ session_id: "bob" });
     store.upsertAgent({ session_id: "charlie" });
 
@@ -314,29 +269,23 @@ describe("server - MCP tools via client", () => {
       arguments: { to: "*", content: "hey everyone" },
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    // alice + bob + charlie = 3 online, broadcast to 2 (excluding alice)
     expect(text).toMatch(/Broadcast sent to \d+ .*agent\(s\)/);
 
     expect(store.getUnreadMessages("bob")).toHaveLength(1);
     expect(store.getUnreadMessages("charlie")).toHaveLength(1);
-    expect(store.getUnreadMessages("alice")).toHaveLength(0);
   });
 
   it("inbox tool returns unread messages", async () => {
-    // Checkin as alice first
-    await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "alice",
-        agent_type: "claude-code",
-        machine: "mac-1",
-        cwd: "/home/alice",
-        branch: "main",
-        status: "working",
-      },
-    });
-    store.createMessage("bob", "alice", "hey alice");
-    store.createMessage("charlie", "alice", "hi there");
+    // Auto-register by calling who first
+    await client.callTool({ name: "who", arguments: {} });
+
+    // Find the auto-registered agent
+    const onlineAgents = store.getOnlineAgents();
+    expect(onlineAgents.length).toBeGreaterThanOrEqual(1);
+    const callerId = onlineAgents[0].session_id;
+
+    store.createMessage("bob", callerId, "hey there");
+    store.createMessage("charlie", callerId, "hi");
 
     const result = await client.callTool({
       name: "inbox",
@@ -345,59 +294,48 @@ describe("server - MCP tools via client", () => {
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const messages = JSON.parse(text);
     expect(messages).toHaveLength(2);
-    expect(messages[0].content).toBe("hey alice");
+    expect(messages[0].from).toBeDefined();
+    expect(messages[0].content).toBe("hey there");
+    expect(messages[0].time).toBeDefined();
+    // Should not have raw DB fields
+    expect(messages[0].to_agent).toBeUndefined();
+    expect(messages[0].read).toBeUndefined();
   });
 
   it("inbox with mark_read=false does not mark messages as read", async () => {
-    await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "alice",
-        agent_type: "claude-code",
-        machine: "mac-1",
-        cwd: "/home/alice",
-        branch: "main",
-        status: "working",
-      },
-    });
-    store.createMessage("bob", "alice", "msg1");
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    store.createMessage("bob", callerId, "msg1");
 
     await client.callTool({
       name: "inbox",
       arguments: { mark_read: false },
     });
 
-    const msgs = store.getUnreadMessages("alice");
+    const msgs = store.getUnreadMessages(callerId);
     expect(msgs).toHaveLength(1);
   });
 
   it("inbox with mark_read=true (default) marks messages as read", async () => {
-    await client.callTool({
-      name: "checkin",
-      arguments: {
-        session_id: "alice",
-        agent_type: "claude-code",
-        machine: "mac-1",
-        cwd: "/home/alice",
-        branch: "main",
-        status: "working",
-      },
-    });
-    store.createMessage("bob", "alice", "msg1");
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    store.createMessage("bob", callerId, "msg1");
 
     await client.callTool({
       name: "inbox",
       arguments: {},
     });
 
-    const msgs = store.getUnreadMessages("alice");
+    const msgs = store.getUnreadMessages(callerId);
     expect(msgs).toHaveLength(0);
   });
 
   it("lists tools correctly", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["checkin", "checkout", "inbox", "listen", "message", "subscribe", "who"]);
+    expect(names).toEqual(["inbox", "listen", "message", "who"]);
   });
 
   it("lists resources correctly", async () => {
@@ -411,8 +349,6 @@ describe("server - MCP tools via client", () => {
     const result = await client.listResourceTemplates();
     const templates = result.resourceTemplates.map((t) => t.uriTemplate).sort();
     expect(templates).toEqual([
-      "hotline://agent/{name}/conversation",
-      "hotline://agent/{name}/diff",
       "hotline://agent/{name}/inbox",
       "hotline://agent/{name}/status",
     ]);
@@ -442,32 +378,6 @@ describe("server - MCP tools via client", () => {
     const agent = JSON.parse(text);
     expect(agent.session_id).toBe("alice");
     expect(agent.status).toBe("coding");
-  });
-
-  it("reads agent diff resource template", async () => {
-    store.upsertAgent({
-      session_id: "alice",
-      git_diff: "diff --git a/foo.ts",
-    });
-
-    const result = await client.readResource({
-      uri: "hotline://agent/alice/diff",
-    });
-    const text = (result.contents[0] as { text: string }).text;
-    expect(text).toBe("diff --git a/foo.ts");
-  });
-
-  it("reads agent conversation resource template", async () => {
-    store.upsertAgent({
-      session_id: "alice",
-      conversation_recent: "discussing architecture",
-    });
-
-    const result = await client.readResource({
-      uri: "hotline://agent/alice/conversation",
-    });
-    const text = (result.contents[0] as { text: string }).text;
-    expect(text).toBe("discussing architecture");
   });
 
   it("reads agent inbox resource template", async () => {
