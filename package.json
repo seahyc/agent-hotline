@@ -7,7 +7,7 @@
     "agent-hotline": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp src/hook.sh dist/hook.sh",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest"

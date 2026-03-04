@@ -2,25 +2,65 @@
 # Agent Hotline hook - runs on every UserPromptSubmit
 # Optimized: ~30ms server up, ~5ms server down
 #
-# Usage: HOTLINE_AGENT=name HOTLINE_SERVER=url bash hook.sh
+# Config: ~/.agent-hotline/config (optional)
+#   HOTLINE_SERVER=http://localhost:3456
+#   HOTLINE_AGENT=my-custom-name
+#
+# Agent name resolution (first match wins):
+#   1. $HOTLINE_AGENT env var or config
+#   2. tmux session name
+#   3. basename of cwd
+#
+# Agent type detection:
+#   $CLAUDECODE=1 -> claude-code
+#   $CODEX=1      -> codex
+#   else          -> unknown
+#
+# Usage in hooks (no hardcoded names or URLs):
+#   "command": "bash ~/.agent-hotline/hook.sh"
 
-AGENT="${HOTLINE_AGENT:-my-agent}"
+# Load config if exists
+[ -f ~/.agent-hotline/config ] && source ~/.agent-hotline/config
+
 SERVER="${HOTLINE_SERVER:-http://localhost:3456}"
 
-# Check inbox first (if this fails, server is down - bail)
+# Read stdin JSON (Claude Code passes {"cwd": "..."} on UserPromptSubmit)
+STDIN_JSON=""
+if read -t 0.01 -r STDIN_JSON 2>/dev/null; then
+  HOOK_CWD=$(echo "$STDIN_JSON" | jq -r '.cwd // empty' 2>/dev/null)
+fi
+CWD="${HOOK_CWD:-$(pwd)}"
+
+# Resolve agent name
+if [ -z "$HOTLINE_AGENT" ]; then
+  if [ -n "$TMUX" ]; then
+    HOTLINE_AGENT=$(tmux display-message -p '#S' 2>/dev/null)
+  fi
+fi
+AGENT="${HOTLINE_AGENT:-$(basename "$CWD")}"
+
+# Detect agent type
+if [ -n "$CLAUDECODE" ]; then
+  AGENT_TYPE="claude-code"
+elif [ -n "$CODEX" ]; then
+  AGENT_TYPE="codex"
+else
+  AGENT_TYPE="unknown"
+fi
+
+# Check inbox first (doubles as server health check)
 MSGS=$(curl -sf --connect-timeout 0.15 --max-time 0.5 "$SERVER/api/inbox/$AGENT" 2>/dev/null) || exit 0
 
-# Print messages if any (avoid jq spawn for empty inbox)
+# Print messages if any (skip jq for empty inbox)
 if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ]; then
   echo "$MSGS" | jq -r '.[] | "[\(.from_agent)] \(.content)"' 2>/dev/null
 fi
 
 # Checkin in background (don't block the prompt)
 {
-  CWD="$(pwd)"
-  BRANCH="$(git branch --show-current 2>/dev/null)"
-  REMOTE="$(git remote get-url origin 2>/dev/null)"
-  DIRTY=$(git diff --name-only 2>/dev/null; git diff --staged --name-only 2>/dev/null)
+  BRANCH="$(git -C "$CWD" branch --show-current 2>/dev/null)"
+  REMOTE="$(git -C "$CWD" remote get-url origin 2>/dev/null)"
+  DIRTY=$(git -C "$CWD" diff --name-only 2>/dev/null; git -C "$CWD" diff --staged --name-only 2>/dev/null)
   DIRTY_JSON="[]"
   if [ -n "$DIRTY" ]; then
     DIRTY_JSON=$(printf '%s\n' "$DIRTY" | sort -u | jq -Rsc 'split("\n") | map(select(. != ""))')
@@ -28,9 +68,8 @@ fi
   curl -sf --connect-timeout 0.5 --max-time 2 \
     -X POST "$SERVER/api/checkin" \
     -H "Content-Type: application/json" \
-    -d "{\"agent_name\":\"$AGENT\",\"agent_type\":\"claude-code\",\"machine\":\"$(hostname -s)\",\"cwd\":\"$CWD\",\"branch\":\"${BRANCH:-unknown}\",\"cwd_remote\":\"$REMOTE\",\"dirty_files\":$DIRTY_JSON}" \
+    -d "{\"agent_name\":\"$AGENT\",\"agent_type\":\"$AGENT_TYPE\",\"machine\":\"$(hostname -s)\",\"cwd\":\"$CWD\",\"branch\":\"${BRANCH:-unknown}\",\"cwd_remote\":\"$REMOTE\",\"dirty_files\":$DIRTY_JSON}" \
     >/dev/null 2>&1
 } &
 
-# Don't wait for background checkin - let prompt proceed immediately
 exit 0

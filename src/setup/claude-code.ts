@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, chmodSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
@@ -12,9 +13,33 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
   const settingsPath = join(homedir(), ".claude", "settings.json");
   const mcpickPath = join(homedir(), ".claude", "mcpick", "servers.json");
   const dir = join(homedir(), ".claude");
+  const hotlineDir = join(homedir(), ".agent-hotline");
 
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
+  }
+
+  // --- Install hook.sh and config ---
+  if (!existsSync(hotlineDir)) {
+    mkdirSync(hotlineDir, { recursive: true });
+  }
+  const thisDir = dirname(fileURLToPath(import.meta.url));
+  const hookSrc = join(thisDir, "hook.sh");
+  // hook.sh lives next to the compiled setup/*.js, or in src/ during dev
+  const hookSrcAlt = join(thisDir, "..", "hook.sh");
+  const hookDst = join(hotlineDir, "hook.sh");
+  const configDst = join(hotlineDir, "config");
+
+  if (existsSync(hookSrc)) {
+    copyFileSync(hookSrc, hookDst);
+    chmodSync(hookDst, 0o755);
+  } else if (existsSync(hookSrcAlt)) {
+    copyFileSync(hookSrcAlt, hookDst);
+    chmodSync(hookDst, 0o755);
+  }
+
+  if (!existsSync(configDst)) {
+    writeFileSync(configDst, `HOTLINE_SERVER=${serverUrl}\n`, "utf-8");
   }
 
   let config: Record<string, unknown> = {};
@@ -69,7 +94,7 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
   }
   const hooks = config.hooks as Record<string, unknown>;
 
-  const hookCommand = `HOTLINE_AGENT=${agentName} HOTLINE_SERVER=${serverUrl} bash ~/.agent-hotline/hook.sh`;
+  const hookCommand = `bash ~/.agent-hotline/hook.sh`;
 
   const desiredHookEntry = {
     matcher: "",
@@ -91,7 +116,7 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
     const innerHooks = entry.hooks as Array<Record<string, unknown>> | undefined;
     if (!Array.isArray(innerHooks)) return false;
     return innerHooks.some(
-      (h) => typeof h.command === "string" && h.command.includes("agent-hotline check"),
+      (h) => typeof h.command === "string" && (h.command.includes("agent-hotline") || h.command.includes("hook.sh")),
     );
   });
 
