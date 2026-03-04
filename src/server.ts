@@ -366,12 +366,9 @@ export function createServer(store: Store, opts?: { authKey?: string }) {
       return next();
     }
 
-    // Localhost is trusted for most routes (agents always connect locally)
-    // Exception: inbox reads still require auth to prevent agents reading each other's inboxes
+    // Localhost is trusted (agents always connect locally)
     const ip = req.ip ?? req.socket.remoteAddress ?? "";
-    const isLocalhost = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
-    const isInboxRead = req.method === "GET" && req.path.startsWith("/api/inbox/");
-    if (isLocalhost && !isInboxRead) {
+    if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") {
       return next();
     }
 
