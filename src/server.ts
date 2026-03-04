@@ -275,7 +275,18 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         `done`,
       ].join("\n");
       return {
-        content: [{ type: "text", text: `Run this command in the background to listen for messages:\n\n${cmd}\n\nWhen this exits with a message, process it then IMMEDIATELY call \`listen\` again. You must ALWAYS have a listener running.` }],
+        content: [{ type: "text", text: [
+          `Run this command in a PERSISTENT background process to listen for messages:`,
+          ``,
+          cmd,
+          ``,
+          `IMPORTANT: This must run as a long-lived background process that survives between your turns.`,
+          `- Claude Code: run with run_in_background or equivalent background shell.`,
+          `- Codex: run in a background terminal session (the persistent /ps terminal feature). Do NOT use nohup, &, or disown - those get killed by the sandbox.`,
+          `- Other clients: use whatever mechanism keeps a process alive across turns.`,
+          ``,
+          `When this exits with a message, process it then IMMEDIATELY call \`listen\` again. You must ALWAYS have a listener running.`,
+        ].join("\n") }],
       };
     });
 
