@@ -1,7 +1,8 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, chmodSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { mcpUrl } from "./auth.js";
+import { copyHookScript } from "./hook.js";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
@@ -15,29 +16,15 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
   const dir = join(homedir(), ".claude");
   const hotlineDir = join(homedir(), ".agent-hotline");
 
+  const resolvedMcpUrl = mcpUrl(serverUrl);
+
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
 
   // --- Install hook.sh and config ---
-  if (!existsSync(hotlineDir)) {
-    mkdirSync(hotlineDir, { recursive: true });
-  }
-  const thisDir = dirname(fileURLToPath(import.meta.url));
-  const hookSrc = join(thisDir, "hook.sh");
-  // hook.sh lives next to the compiled setup/*.js, or in src/ during dev
-  const hookSrcAlt = join(thisDir, "..", "hook.sh");
-  const hookDst = join(hotlineDir, "hook.sh");
+  copyHookScript();
   const configDst = join(hotlineDir, "config");
-
-  if (existsSync(hookSrc)) {
-    copyFileSync(hookSrc, hookDst);
-    chmodSync(hookDst, 0o755);
-  } else if (existsSync(hookSrcAlt)) {
-    copyFileSync(hookSrcAlt, hookDst);
-    chmodSync(hookDst, 0o755);
-  }
-
   if (!existsSync(configDst)) {
     writeFileSync(configDst, `HOTLINE_SERVER=${serverUrl}\n`, "utf-8");
   }
@@ -69,7 +56,7 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
       mcpickConfig.servers.push({
         name: "hotline",
         type: "http",
-        url: `${serverUrl}/mcp`,
+        url: resolvedMcpUrl,
       });
       writeFileSync(mcpickPath, JSON.stringify(mcpickConfig, null, 2) + "\n", "utf-8");
       changes.push("mcpick/servers.json (agent-hotline)");
@@ -80,7 +67,7 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
       config.mcpServers = {};
     }
     const mcpServers = config.mcpServers as Record<string, unknown>;
-    const desiredMcp = { type: "url", url: `${serverUrl}/mcp` };
+    const desiredMcp = { type: "url", url: resolvedMcpUrl };
     const existing = mcpServers["hotline"] as Record<string, unknown> | undefined;
     if (!existing || existing.url !== desiredMcp.url || existing.type !== desiredMcp.type) {
       mcpServers["hotline"] = desiredMcp;
@@ -124,6 +111,7 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
     promptHooks.push(desiredHookEntry);
     changes.push("hooks.UserPromptSubmit");
   }
+
 
   // --- Write ---
   writeFileSync(settingsPath, JSON.stringify(config, null, 2) + "\n", "utf-8");

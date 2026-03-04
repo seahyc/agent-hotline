@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { mcpUrl } from "./auth.js";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
@@ -32,7 +33,7 @@ export function setupCodex(agentName: string, serverUrl: string): void {
     "",
     "[mcp_servers.hotline]",
     'type = "url"',
-    `url = "${serverUrl}/mcp"`,
+    `url = "${mcpUrl(serverUrl)}"`,
     "",
   ].join("\n");
 

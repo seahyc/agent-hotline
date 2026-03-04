@@ -4,20 +4,40 @@ import { z } from "zod";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import type { Store } from "./store.js";
+import type { Store, EventType } from "./store.js";
+
+/** Deliver an event notification to all subscribers (as inbox messages). */
+function notifySubscribers(store: Store, event: EventType, subjectAgent: string, text: string): void {
+  const subscribers = store.getSubscribers(event);
+  for (const sub of subscribers) {
+    if (sub !== subjectAgent) {
+      store.createMessage("system", sub, text);
+    }
+  }
+}
 
 const INSTRUCTIONS = `Agent Hotline - Cross-machine agent communication.
 At the START of each session:
-1. Call \`checkin\` with your current status, cwd, branch, files, and background processes (pid, port, command, description).
-2. Call \`who\` to see other online agents and their background processes (to avoid port conflicts).
-3. Read your inbox for unread messages.
-When your status changes significantly, call \`checkin\` again.
-Before starting a process on a port, check \`who\` to see if another agent already uses that port.`;
+1. Call \`checkin\` with your status, cwd, branch, files, and background processes.
+2. Call \`who\` to see other online agents.
+3. Call \`inbox\` to read unread messages.
+4. Call \`listen\` and run the returned command in background to receive messages in real-time.
+When your status changes, call \`checkin\` again.
+IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.`;
 
-export function createServer(store: Store) {
+export function createServer(store: Store, opts?: { authKey?: string }) {
+  // Auth is always enforced. Auto-generate a master key if none provided.
+  const masterKey = opts?.authKey ?? store.createApiKey("master-auto");
+
+  // Register the provided master key as an API key (auto-generated ones are already stored)
+  if (opts?.authKey && !store.validateApiKey(opts.authKey)) {
+    store.addApiKey(opts.authKey, "master");
+  }
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
   const getServer = () => {
+    let sessionAgent: string | null = null;
+
     const mcpServer = new McpServer(
       { name: "hotline", version: "0.1.0" },
       { instructions: INSTRUCTIONS },
@@ -28,7 +48,7 @@ export function createServer(store: Store) {
       description: "Push your context to the server",
       inputSchema: {
         agent_name: z.string(),
-        agent_type: z.enum(["claude-code", "opencode", "codex"]),
+        agent_type: z.string().describe("e.g. claude-code, opencode, codex, cursor, windsurf"),
         machine: z.string(),
         cwd: z.string(),
         cwd_remote: z.string().optional(),
@@ -43,8 +63,14 @@ export function createServer(store: Store) {
         })).optional(),
         git_diff: z.string().optional(),
         conversation_recent: z.string().optional(),
+        session_id: z.string().optional(),
+        terminal: z.string().optional(),
+        pid: z.number().optional(),
       },
     }, async (args) => {
+      sessionAgent = args.agent_name;
+      const existing = store.getAgent(args.agent_name);
+      const wasOffline = !existing || !existing.online;
       store.upsertAgent({
         agent_name: args.agent_name,
         agent_type: args.agent_type,
@@ -57,7 +83,14 @@ export function createServer(store: Store) {
         background_processes: args.background_processes ? JSON.stringify(args.background_processes) : "[]",
         git_diff: args.git_diff ?? "",
         conversation_recent: args.conversation_recent ?? "",
+        session_id: args.session_id ?? "",
+        terminal: args.terminal ?? "",
+        pid: args.pid ?? 0,
       });
+      if (wasOffline) {
+        notifySubscribers(store, "agent_online", args.agent_name,
+          `${args.agent_name} is now online (${args.machine}, ${args.cwd})`);
+      }
       return {
         content: [{ type: "text", text: `Checked in as ${args.agent_name}` }],
       };
@@ -65,12 +98,17 @@ export function createServer(store: Store) {
 
     // ── Tool: who ──
     mcpServer.registerTool("who", {
-      description: "See online agents. Optionally filter by `room` (substring matched against agents' cwd).",
+      description: "See agents. Defaults to online only. Set `all: true` to include offline agents. Optionally filter by `cwd_filter` (substring matched against agents' cwd).",
       inputSchema: {
-        room: z.string().optional(),
+        cwd_filter: z.string().optional(),
+        all: z.boolean().optional().default(false),
       },
     }, async (args) => {
-      const agents = store.getAgents(args.room);
+      let agents = args.all ? store.getAgents(args.cwd_filter) : store.getOnlineAgents();
+      if (!args.all && args.cwd_filter) {
+        const filter = args.cwd_filter.toLowerCase();
+        agents = agents.filter((a) => a.cwd.toLowerCase().includes(filter));
+      }
       const list = agents.map((a) => ({
         name: a.agent_name,
         type: a.agent_type,
@@ -81,6 +119,9 @@ export function createServer(store: Store) {
         status: a.status,
         dirty_files: JSON.parse(a.dirty_files || "[]"),
         background_processes: JSON.parse(a.background_processes || "[]"),
+        session_id: a.session_id || undefined,
+        terminal: a.terminal || undefined,
+        pid: a.pid || undefined,
         last_seen: a.last_seen,
         online: a.online,
       }));
@@ -91,15 +132,21 @@ export function createServer(store: Store) {
 
     // ── Tool: message ──
     mcpServer.registerTool("message", {
-      description: "Send a message to another agent (or '*' to broadcast)",
+      description: "Send a message to another agent (or '*' to broadcast to all online agents)",
       inputSchema: {
         from: z.string(),
         to: z.string(),
         content: z.string(),
       },
     }, async (args) => {
+      if (sessionAgent && args.from !== sessionAgent) {
+        return {
+          content: [{ type: "text", text: `Error: 'from' must match your checked-in identity (${sessionAgent})` }],
+          isError: true,
+        };
+      }
       if (args.to === "*") {
-        const agents = store.getAgents();
+        const agents = store.getOnlineAgents();
         let count = 0;
         for (const a of agents) {
           if (a.agent_name !== args.from) {
@@ -108,7 +155,7 @@ export function createServer(store: Store) {
           }
         }
         return {
-          content: [{ type: "text", text: `Broadcast sent to ${count} agent(s)` }],
+          content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
         };
       }
       store.createMessage(args.from, args.to, args.content);
@@ -119,18 +166,110 @@ export function createServer(store: Store) {
 
     // ── Tool: inbox ──
     mcpServer.registerTool("inbox", {
-      description: "Read your unread messages",
+      description: "Read your unread messages (must checkin first)",
       inputSchema: {
-        agent_name: z.string(),
         mark_read: z.boolean().optional().default(true),
       },
     }, async (args) => {
-      const messages = store.getUnreadMessages(args.agent_name);
+      if (!sessionAgent) {
+        return {
+          content: [{ type: "text", text: "Error: Call checkin first" }],
+          isError: true,
+        };
+      }
+      const messages = store.getUnreadMessages(sessionAgent);
       if (args.mark_read) {
-        store.markRead(args.agent_name);
+        store.markRead(sessionAgent);
       }
       return {
         content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
+      };
+    });
+
+    // ── Tool: subscribe ──
+    mcpServer.registerTool("subscribe", {
+      description: "Manage your event subscriptions (must checkin first). Events: agent_online, agent_offline. Subscribed events appear as system messages in your inbox.",
+      inputSchema: {
+        add: z.array(z.enum(["agent_online", "agent_offline"])).optional(),
+        remove: z.array(z.enum(["agent_online", "agent_offline"])).optional(),
+      },
+    }, async (args) => {
+      if (!sessionAgent) {
+        return {
+          content: [{ type: "text", text: "Error: Call checkin first" }],
+          isError: true,
+        };
+      }
+      if (args.add?.length) {
+        store.subscribe(sessionAgent, args.add);
+      }
+      if (args.remove?.length) {
+        store.unsubscribe(sessionAgent, args.remove);
+      }
+      const current = store.getSubscriptions(sessionAgent);
+      return {
+        content: [{ type: "text", text: `Subscriptions for ${sessionAgent}: ${current.length ? current.join(", ") : "none"}` }],
+      };
+    });
+
+    // ── Tool: listen ──
+    mcpServer.registerTool("listen", {
+      description: [
+        "Get a background polling command that watches your inbox and exits when a message arrives (must checkin first).",
+        "Run the returned command as a background process. When it exits, you will be woken up with the message.",
+        "IMPORTANT: After processing the message, call `listen` again to resume monitoring.",
+      ].join(" "),
+      inputSchema: {
+        poll_interval: z.number().optional().default(3),
+      },
+    }, async (args) => {
+      if (!sessionAgent) {
+        return {
+          content: [{ type: "text", text: "Error: Call checkin first" }],
+          isError: true,
+        };
+      }
+      const serverUrl = "http://localhost:3456";
+      const cmd = [
+        `AGENT="${sessionAgent}"`,
+        `SERVER="${serverUrl}"`,
+        `PIDFILE=~/.agent-hotline/poller-$AGENT.pid`,
+        `[ -f ~/.agent-hotline/config ] && . ~/.agent-hotline/config`,
+        `hcurl() { if [ -n "$HOTLINE_AUTH_KEY" ]; then curl -H "Authorization: Bearer $HOTLINE_AUTH_KEY" "$@"; else curl "$@"; fi; }`,
+        // Kill existing poller if running
+        `if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then kill "$(cat "$PIDFILE")" 2>/dev/null; fi`,
+        `echo $$ > "$PIDFILE"`,
+        `trap 'rm -f "$PIDFILE"' EXIT`,
+        `while true; do`,
+        `  MSGS=$(hcurl -sf "$SERVER/api/inbox/$AGENT" 2>/dev/null)`,
+        `  if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ]; then`,
+        `    echo "$MSGS" | jq -r '.[] | "[\\(.from_agent)] \\(.content)"' 2>/dev/null`,
+        `    exit 0`,
+        `  fi`,
+        `  sleep ${args.poll_interval}`,
+        `done`,
+      ].join("; ");
+      return {
+        content: [{ type: "text", text: `Run this command in the background to listen for messages:\n\n${cmd}\n\nWhen this exits with a message, process it and call \`listen\` again to resume.` }],
+      };
+    });
+
+    // ── Tool: checkout ──
+    mcpServer.registerTool("checkout", {
+      description: "Mark yourself as offline (call before exiting)",
+      inputSchema: {},
+    }, async () => {
+      if (!sessionAgent) {
+        return {
+          content: [{ type: "text", text: "Error: Call checkin first" }],
+          isError: true,
+        };
+      }
+      store.markOffline(sessionAgent);
+      notifySubscribers(store, "agent_offline", sessionAgent,
+        `${sessionAgent} went offline`);
+      return {
+        content: [{ type: "text", text: `${sessionAgent} checked out` }],
       };
     });
 
@@ -213,12 +352,31 @@ export function createServer(store: Store) {
       },
     );
 
-    return mcpServer;
+    return { mcpServer, getSessionAgent: () => sessionAgent };
   };
 
   // ── Express app ──
   const app = express();
   app.use(express.json());
+
+  // ── Auth middleware ──
+  app.use((req, res, next) => {
+    // Public routes
+    if (req.path === "/health" || (req.method === "POST" && req.path === "/api/connect")) {
+      return next();
+    }
+
+    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    const queryKey = req.query.key as string | undefined;
+    const key = bearer || queryKey;
+
+    if (!key || !store.validateApiKey(key)) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    next();
+  });
 
   const handlePost = async (
     req: express.Request,
@@ -239,14 +397,20 @@ export function createServer(store: Store) {
           },
         });
 
+        const { mcpServer: server, getSessionAgent } = getServer();
+
         transport.onclose = () => {
           const sid = transport.sessionId;
           if (sid && transports[sid]) {
             delete transports[sid];
           }
+          const agent = getSessionAgent();
+          if (agent) {
+            store.markOffline(agent);
+            notifySubscribers(store, "agent_offline", agent, `${agent} went offline`);
+          }
         };
 
-        const server = getServer();
         await server.connect(transport);
         await transport.handleRequest(req, res, req.body);
         return;
@@ -333,6 +497,8 @@ export function createServer(store: Store) {
       res.status(400).json({ error: "agent_name is required" });
       return;
     }
+    const existing = store.getAgent(body.agent_name);
+    const wasOffline = !existing || !existing.online;
     store.upsertAgent({
       agent_name: body.agent_name,
       agent_type: body.agent_type ?? "",
@@ -345,8 +511,61 @@ export function createServer(store: Store) {
       background_processes: body.background_processes ? JSON.stringify(body.background_processes) : "[]",
       git_diff: body.git_diff ?? "",
       conversation_recent: body.conversation_recent ?? "",
+      session_id: body.session_id ?? "",
+      terminal: body.terminal ?? "",
+      pid: body.pid ?? 0,
     });
+    if (wasOffline) {
+      notifySubscribers(store, "agent_online", body.agent_name,
+        `${body.agent_name} is now online (${body.machine ?? "unknown"}, ${body.cwd ?? ""})`);
+    }
     res.json({ ok: true, agent_name: body.agent_name });
+  });
+
+  // POST /api/checkout - mark agent offline via REST
+  app.post("/api/checkout", (req, res) => {
+    const { agent_name } = req.body;
+    if (!agent_name) {
+      res.status(400).json({ error: "agent_name is required" });
+      return;
+    }
+    store.markOffline(agent_name);
+    notifySubscribers(store, "agent_offline", agent_name, `${agent_name} went offline`);
+    res.json({ ok: true, agent_name });
+  });
+
+  // POST /api/invite - generate an invite code (requires master key)
+  app.post("/api/invite", (req, res) => {
+    const code = store.createInviteCode();
+    res.json({ code });
+  });
+
+  // POST /api/connect - redeem an invite code for an API key (public)
+  app.post("/api/connect", (req, res) => {
+    const { code } = req.body;
+    if (!code) {
+      res.status(400).json({ error: "code is required" });
+      return;
+    }
+    const key = store.redeemInviteCode(code);
+    if (!key) {
+      res.status(400).json({ error: "Invalid or already used invite code" });
+      return;
+    }
+    res.json({ key });
+  });
+
+  // POST /api/heartbeat - batch touch last_seen for agents from a client server
+  app.post("/api/heartbeat", (req, res) => {
+    const { agents } = req.body;
+    if (!Array.isArray(agents)) {
+      res.status(400).json({ error: "agents array is required" });
+      return;
+    }
+    for (const a of agents) {
+      if (a.name) store.touchAgent(a.name);
+    }
+    res.json({ ok: true });
   });
 
   // POST /api/message - send a message via REST
@@ -357,7 +576,7 @@ export function createServer(store: Store) {
       return;
     }
     if (to === "*") {
-      const agents = store.getAgents();
+      const agents = store.getOnlineAgents();
       let count = 0;
       for (const a of agents) {
         if (a.agent_name !== from) {
@@ -372,5 +591,5 @@ export function createServer(store: Store) {
     }
   });
 
-  return { app, getServer, transports };
+  return { app, getServer, transports, masterKey };
 }

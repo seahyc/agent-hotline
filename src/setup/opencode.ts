@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { mcpUrl } from "./auth.js";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
@@ -28,7 +29,7 @@ export function setupOpenCode(agentName: string, serverUrl: string): void {
 
   const desiredMcp = {
     type: "remote",
-    url: `${serverUrl}/mcp`,
+    url: mcpUrl(serverUrl),
   };
 
   const existing = mcp["hotline"] as Record<string, unknown> | undefined;
