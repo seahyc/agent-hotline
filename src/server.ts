@@ -614,5 +614,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     }
   });
 
+  // Catch-all: return JSON 404 (prevents Express HTML 404 from confusing MCP OAuth discovery)
+  app.use((_req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
   return { app, getServer, transports, masterKey };
 }
