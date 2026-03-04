@@ -19,7 +19,7 @@ describe("store", () => {
   });
 
   afterEach(() => {
-    store.db.close();
+    store.close();
   });
 
   describe("createStore", () => {

@@ -25,7 +25,7 @@ export interface Message {
 }
 
 export interface Store {
-  db: Database.Database;
+  close(): void;
   upsertAgent(agent: Partial<Agent> & { agent_name: string }): void;
   getAgents(room?: string): Agent[];
   getAgent(name: string): Agent | null;
@@ -62,11 +62,16 @@ CREATE TABLE IF NOT EXISTS messages (
   read INTEGER DEFAULT 0
 )`;
 
+const CREATE_MESSAGES_INDEX = `
+CREATE INDEX IF NOT EXISTS idx_messages_to_unread
+  ON messages(to_agent, read)`;
+
 export function createStore(dbPath?: string): Store {
   const db = new Database(dbPath ?? "./hotline.db");
   db.pragma("journal_mode = WAL");
   db.exec(CREATE_AGENTS);
   db.exec(CREATE_MESSAGES);
+  db.exec(CREATE_MESSAGES_INDEX);
 
   const upsertAgentStmt = db.prepare(`
     INSERT INTO agents (agent_name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, git_diff, conversation_recent, last_seen, online)
@@ -87,7 +92,7 @@ export function createStore(dbPath?: string): Store {
 
   const getAgentsStmt = db.prepare("SELECT * FROM agents");
   const getAgentsByRoomStmt = db.prepare(
-    "SELECT * FROM agents WHERE cwd LIKE ?",
+    "SELECT * FROM agents WHERE cwd LIKE ? ESCAPE '\\'",
   );
   const getAgentStmt = db.prepare(
     "SELECT * FROM agents WHERE agent_name = ?",
@@ -110,7 +115,9 @@ export function createStore(dbPath?: string): Store {
   );
 
   return {
-    db,
+    close() {
+      db.close();
+    },
 
     upsertAgent(agent) {
       const now = Date.now();
@@ -133,7 +140,8 @@ export function createStore(dbPath?: string): Store {
 
     getAgents(room?: string) {
       if (room) {
-        return getAgentsByRoomStmt.all(`%${room}%`) as Agent[];
+        const escaped = room.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+        return getAgentsByRoomStmt.all(`%${escaped}%`) as Agent[];
       }
       return getAgentsStmt.all() as Agent[];
     },
