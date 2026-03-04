@@ -10,6 +10,7 @@ const YELLOW = "\x1b[33m";
 
 export function setupClaudeCode(agentName: string, serverUrl: string): void {
   const settingsPath = join(homedir(), ".claude", "settings.json");
+  const mcpickPath = join(homedir(), ".claude", "mcpick", "servers.json");
   const dir = join(homedir(), ".claude");
 
   if (!existsSync(dir)) {
@@ -27,21 +28,39 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
 
   const changes: string[] = [];
 
-  // --- MCP server config ---
-  if (!config.mcpServers || typeof config.mcpServers !== "object") {
-    config.mcpServers = {};
-  }
-  const mcpServers = config.mcpServers as Record<string, unknown>;
-
-  const desiredMcp = {
-    type: "url",
-    url: `${serverUrl}/mcp`,
-  };
-
-  const existing = mcpServers["agent-hotline"] as Record<string, unknown> | undefined;
-  if (!existing || existing.url !== desiredMcp.url || existing.type !== desiredMcp.type) {
-    mcpServers["agent-hotline"] = desiredMcp;
-    changes.push("mcpServers.agent-hotline");
+  // --- MCPick config (preferred if mcpick directory exists) ---
+  const mcpickDir = join(homedir(), ".claude", "mcpick");
+  if (existsSync(mcpickDir)) {
+    let mcpickConfig: { servers: Array<Record<string, unknown>> } = { servers: [] };
+    if (existsSync(mcpickPath)) {
+      try {
+        mcpickConfig = JSON.parse(readFileSync(mcpickPath, "utf-8"));
+      } catch {
+        mcpickConfig = { servers: [] };
+      }
+    }
+    const hasEntry = mcpickConfig.servers.some((s) => s.name === "agent-hotline");
+    if (!hasEntry) {
+      mcpickConfig.servers.push({
+        name: "agent-hotline",
+        type: "http",
+        url: `${serverUrl}/mcp`,
+      });
+      writeFileSync(mcpickPath, JSON.stringify(mcpickConfig, null, 2) + "\n", "utf-8");
+      changes.push("mcpick/servers.json (agent-hotline)");
+    }
+  } else {
+    // Fallback: add to settings.json mcpServers
+    if (!config.mcpServers || typeof config.mcpServers !== "object") {
+      config.mcpServers = {};
+    }
+    const mcpServers = config.mcpServers as Record<string, unknown>;
+    const desiredMcp = { type: "url", url: `${serverUrl}/mcp` };
+    const existing = mcpServers["agent-hotline"] as Record<string, unknown> | undefined;
+    if (!existing || existing.url !== desiredMcp.url || existing.type !== desiredMcp.type) {
+      mcpServers["agent-hotline"] = desiredMcp;
+      changes.push("mcpServers.agent-hotline");
+    }
   }
 
   // --- Hook config ---
