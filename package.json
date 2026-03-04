@@ -1,0 +1,32 @@
+{
+  "name": "agent-hotline",
+  "version": "0.1.0",
+  "description": "Cross-machine agent communication - MSN Messenger for coding agents",
+  "type": "module",
+  "bin": {
+    "agent-hotline": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": ["mcp", "ai-agents", "claude-code", "opencode", "codex", "communication"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.8.1",
+    "commander": "^13.1.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.2",
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.3"
+  }
+}
