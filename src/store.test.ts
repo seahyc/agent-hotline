@@ -32,7 +32,7 @@ describe("store", () => {
   describe("upsertAgent / getAgent / getAgents", () => {
     it("inserts a new agent and retrieves it", () => {
       store.upsertAgent({
-        agent_name: "alice",
+        session_id: "alice",
         agent_type: "claude-code",
         machine: "mac-1",
         cwd: "/home/alice/project",
@@ -42,7 +42,7 @@ describe("store", () => {
 
       const agent = store.getAgent("alice");
       expect(agent).not.toBeNull();
-      expect(agent!.agent_name).toBe("alice");
+      expect(agent!.session_id).toBe("alice");
       expect(agent!.agent_type).toBe("claude-code");
       expect(agent!.cwd).toBe("/home/alice/project");
       expect(agent!.online).toBe(1);
@@ -50,8 +50,8 @@ describe("store", () => {
     });
 
     it("updates existing agent on upsert", () => {
-      store.upsertAgent({ agent_name: "bob", status: "idle" });
-      store.upsertAgent({ agent_name: "bob", status: "busy" });
+      store.upsertAgent({ session_id: "bob", status: "idle" });
+      store.upsertAgent({ session_id: "bob", status: "busy" });
 
       const agents = store.getAgents();
       expect(agents).toHaveLength(1);
@@ -63,13 +63,13 @@ describe("store", () => {
     });
 
     it("filters agents by room (cwd substring)", () => {
-      store.upsertAgent({ agent_name: "a1", cwd: "/home/user/project-x" });
-      store.upsertAgent({ agent_name: "a2", cwd: "/home/user/project-y" });
-      store.upsertAgent({ agent_name: "a3", cwd: "/home/user/project-x/sub" });
+      store.upsertAgent({ session_id: "a1", cwd: "/home/user/project-x" });
+      store.upsertAgent({ session_id: "a2", cwd: "/home/user/project-y" });
+      store.upsertAgent({ session_id: "a3", cwd: "/home/user/project-x/sub" });
 
       const filtered = store.getAgents("project-x");
       expect(filtered).toHaveLength(2);
-      const names = filtered.map((a) => a.agent_name).sort();
+      const names = filtered.map((a) => a.session_id).sort();
       expect(names).toEqual(["a1", "a3"]);
     });
   });
@@ -114,30 +114,30 @@ describe("store", () => {
 
   describe("online/offline", () => {
     it("upsertAgent sets online=1", () => {
-      store.upsertAgent({ agent_name: "alice" });
+      store.upsertAgent({ session_id: "alice" });
       expect(store.getAgent("alice")!.online).toBe(1);
     });
 
     it("markOffline sets online=0", () => {
-      store.upsertAgent({ agent_name: "alice" });
+      store.upsertAgent({ session_id: "alice" });
       store.markOffline("alice");
       expect(store.getAgent("alice")!.online).toBe(0);
     });
 
     it("getOnlineAgents returns only online agents", () => {
-      store.upsertAgent({ agent_name: "alice" });
-      store.upsertAgent({ agent_name: "bob" });
+      store.upsertAgent({ session_id: "alice" });
+      store.upsertAgent({ session_id: "bob" });
       store.markOffline("bob");
 
       const online = store.getOnlineAgents();
       expect(online).toHaveLength(1);
-      expect(online[0].agent_name).toBe("alice");
+      expect(online[0].session_id).toBe("alice");
     });
 
     it("re-upsert brings agent back online", () => {
-      store.upsertAgent({ agent_name: "alice" });
+      store.upsertAgent({ session_id: "alice" });
       store.markOffline("alice");
-      store.upsertAgent({ agent_name: "alice" });
+      store.upsertAgent({ session_id: "alice" });
       expect(store.getAgent("alice")!.online).toBe(1);
     });
   });

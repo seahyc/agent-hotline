@@ -5,7 +5,7 @@ import type { Agent } from "./store.js";
 
 function makeAgent(name: string, lastSeen: number): Agent {
   return {
-    agent_name: name,
+    session_id: name,
     agent_type: "",
     machine: "",
     cwd: "",

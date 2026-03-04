@@ -29,9 +29,9 @@ function mockStore(): Store {
   return {
     close: vi.fn(),
     upsertAgent: vi.fn((agent) => {
-      const idx = agents.findIndex((a) => a.agent_name === agent.agent_name);
+      const idx = agents.findIndex((a) => a.session_id === agent.session_id);
       const full: Agent = {
-        agent_name: agent.agent_name,
+        session_id: agent.session_id,
         agent_type: agent.agent_type ?? "",
         machine: agent.machine ?? "",
         cwd: agent.cwd ?? "",
@@ -51,7 +51,7 @@ function mockStore(): Store {
       if (room) return agents.filter((a) => a.cwd.includes(room));
       return [...agents];
     }),
-    getAgent: vi.fn((name: string) => agents.find((a) => a.agent_name === name) ?? null),
+    getAgent: vi.fn((name: string) => agents.find((a) => a.session_id === name) ?? null),
     createMessage: vi.fn((from: string, to: string, content: string) => {
       messages.push({ id: ++msgId, from_agent: from, to_agent: to, content, timestamp: Date.now(), read: 0 });
     }),
@@ -143,7 +143,7 @@ describe("server - MCP tools via client", () => {
     const result = await client.callTool({
       name: "checkin",
       arguments: {
-        agent_name: "alice",
+        session_id: "alice",
         agent_type: "claude-code",
         machine: "mac-1",
         cwd: "/home/alice/project",
@@ -166,7 +166,7 @@ describe("server - MCP tools via client", () => {
     const result = await client.callTool({
       name: "checkin",
       arguments: {
-        agent_name: "bob",
+        session_id: "bob",
         agent_type: "opencode",
         machine: "linux-1",
         cwd: "/home/bob/repo",
@@ -190,7 +190,7 @@ describe("server - MCP tools via client", () => {
 
   it("who tool returns agents", async () => {
     store.upsertAgent({
-      agent_name: "alice",
+      session_id: "alice",
       agent_type: "claude-code",
       machine: "mac",
       cwd: "/project",
@@ -207,8 +207,8 @@ describe("server - MCP tools via client", () => {
   });
 
   it("who with room filter", async () => {
-    store.upsertAgent({ agent_name: "a1", cwd: "/home/user/project-x" });
-    store.upsertAgent({ agent_name: "a2", cwd: "/home/user/project-y" });
+    store.upsertAgent({ session_id: "a1", cwd: "/home/user/project-x" });
+    store.upsertAgent({ session_id: "a2", cwd: "/home/user/project-y" });
 
     const result = await client.callTool({
       name: "who",
@@ -221,7 +221,7 @@ describe("server - MCP tools via client", () => {
   });
 
   it("message tool sends direct message", async () => {
-    store.upsertAgent({ agent_name: "bob" });
+    store.upsertAgent({ session_id: "bob" });
 
     const result = await client.callTool({
       name: "message",
@@ -238,9 +238,9 @@ describe("server - MCP tools via client", () => {
   });
 
   it("message tool broadcasts to all except sender", async () => {
-    store.upsertAgent({ agent_name: "alice" });
-    store.upsertAgent({ agent_name: "bob" });
-    store.upsertAgent({ agent_name: "charlie" });
+    store.upsertAgent({ session_id: "alice" });
+    store.upsertAgent({ session_id: "bob" });
+    store.upsertAgent({ session_id: "charlie" });
 
     const result = await client.callTool({
       name: "message",
@@ -260,7 +260,7 @@ describe("server - MCP tools via client", () => {
 
     const result = await client.callTool({
       name: "inbox",
-      arguments: { agent_name: "alice" },
+      arguments: { session_id: "alice" },
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const messages = JSON.parse(text);
@@ -273,7 +273,7 @@ describe("server - MCP tools via client", () => {
 
     await client.callTool({
       name: "inbox",
-      arguments: { agent_name: "alice", mark_read: false },
+      arguments: { session_id: "alice", mark_read: false },
     });
 
     // Messages should still be unread
@@ -286,7 +286,7 @@ describe("server - MCP tools via client", () => {
 
     await client.callTool({
       name: "inbox",
-      arguments: { agent_name: "alice" },
+      arguments: { session_id: "alice" },
     });
 
     const msgs = store.getUnreadMessages("alice");
@@ -318,18 +318,18 @@ describe("server - MCP tools via client", () => {
   });
 
   it("reads hotline://agents resource", async () => {
-    store.upsertAgent({ agent_name: "alice", status: "working" });
+    store.upsertAgent({ session_id: "alice", status: "working" });
 
     const result = await client.readResource({ uri: "hotline://agents" });
     const text = (result.contents[0] as { text: string }).text;
     const agents = JSON.parse(text);
     expect(agents).toHaveLength(1);
-    expect(agents[0].agent_name).toBe("alice");
+    expect(agents[0].session_id).toBe("alice");
   });
 
   it("reads agent status resource template", async () => {
     store.upsertAgent({
-      agent_name: "alice",
+      session_id: "alice",
       status: "coding",
       cwd: "/home/alice",
     });
@@ -339,13 +339,13 @@ describe("server - MCP tools via client", () => {
     });
     const text = (result.contents[0] as { text: string }).text;
     const agent = JSON.parse(text);
-    expect(agent.agent_name).toBe("alice");
+    expect(agent.session_id).toBe("alice");
     expect(agent.status).toBe("coding");
   });
 
   it("reads agent diff resource template", async () => {
     store.upsertAgent({
-      agent_name: "alice",
+      session_id: "alice",
       git_diff: "diff --git a/foo.ts",
     });
 
@@ -358,7 +358,7 @@ describe("server - MCP tools via client", () => {
 
   it("reads agent conversation resource template", async () => {
     store.upsertAgent({
-      agent_name: "alice",
+      session_id: "alice",
       conversation_recent: "discussing architecture",
     });
 
@@ -370,7 +370,7 @@ describe("server - MCP tools via client", () => {
   });
 
   it("reads agent inbox resource template", async () => {
-    store.upsertAgent({ agent_name: "alice" });
+    store.upsertAgent({ session_id: "alice" });
     store.createMessage("bob", "alice", "hello");
 
     const result = await client.readResource({

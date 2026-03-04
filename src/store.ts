@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
 
 export interface Agent {
-  agent_name: string;
+  session_id: string;
   agent_type: string;
   machine: string;
   cwd: string;
@@ -13,7 +13,6 @@ export interface Agent {
   background_processes: string; // JSON array of {pid, port?, command, description}
   git_diff: string;
   conversation_recent: string;
-  session_id: string;
   terminal: string;
   pid: number;
   last_seen: number; // unix ms
@@ -33,20 +32,20 @@ export type EventType = "agent_online" | "agent_offline";
 
 export interface Store {
   close(): void;
-  upsertAgent(agent: Partial<Agent> & { agent_name: string }): void;
+  upsertAgent(agent: Partial<Agent> & { session_id: string }): void;
   getAgents(room?: string): Agent[];
-  getAgent(name: string): Agent | null;
+  getAgent(sessionId: string): Agent | null;
   createMessage(from: string, to: string, content: string): void;
-  getUnreadMessages(agentName: string): Message[];
-  markRead(agentName: string): void;
-  markOffline(agentName: string): void;
+  getUnreadMessages(sessionId: string): Message[];
+  markRead(sessionId: string): void;
+  markOffline(sessionId: string): void;
   getOnlineAgents(): Agent[];
-  subscribe(agentName: string, events: EventType[]): void;
-  unsubscribe(agentName: string, events: EventType[]): void;
-  getSubscriptions(agentName: string): EventType[];
+  subscribe(sessionId: string, events: EventType[]): void;
+  unsubscribe(sessionId: string, events: EventType[]): void;
+  getSubscriptions(sessionId: string): EventType[];
   getSubscribers(event: EventType): string[];
   purgeOldMessages(maxAgeDays: number): number;
-  touchAgent(agentName: string): void;
+  touchAgent(sessionId: string): void;
   addApiKey(key: string, label: string): void;
   createApiKey(label: string): string;
   validateApiKey(key: string): boolean;
@@ -57,7 +56,7 @@ export interface Store {
 
 const CREATE_AGENTS = `
 CREATE TABLE IF NOT EXISTS agents (
-  agent_name TEXT PRIMARY KEY,
+  session_id TEXT PRIMARY KEY,
   agent_type TEXT DEFAULT '',
   machine TEXT DEFAULT '',
   cwd TEXT DEFAULT '',
@@ -68,7 +67,6 @@ CREATE TABLE IF NOT EXISTS agents (
   background_processes TEXT DEFAULT '[]',
   git_diff TEXT DEFAULT '',
   conversation_recent TEXT DEFAULT '',
-  session_id TEXT DEFAULT '',
   terminal TEXT DEFAULT '',
   pid INTEGER DEFAULT 0,
   last_seen INTEGER DEFAULT 0,
@@ -91,9 +89,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_to_unread
 
 const CREATE_SUBSCRIPTIONS = `
 CREATE TABLE IF NOT EXISTS subscriptions (
-  agent_name TEXT NOT NULL,
+  session_id TEXT NOT NULL,
   event TEXT NOT NULL,
-  PRIMARY KEY (agent_name, event)
+  PRIMARY KEY (session_id, event)
 )`;
 
 const CREATE_API_KEYS = `
@@ -120,17 +118,10 @@ export function createStore(dbPath?: string): Store {
   db.exec(CREATE_API_KEYS);
   db.exec(CREATE_INVITE_CODES);
 
-  // Migrate: add new columns if missing
-  const cols = db.prepare("PRAGMA table_info(agents)").all() as { name: string }[];
-  const colNames = new Set(cols.map((c) => c.name));
-  if (!colNames.has("session_id")) db.exec("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT ''");
-  if (!colNames.has("terminal")) db.exec("ALTER TABLE agents ADD COLUMN terminal TEXT DEFAULT ''");
-  if (!colNames.has("pid")) db.exec("ALTER TABLE agents ADD COLUMN pid INTEGER DEFAULT 0");
-
   const upsertAgentStmt = db.prepare(`
-    INSERT INTO agents (agent_name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, session_id, terminal, pid, last_seen, online)
-    VALUES (@agent_name, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @session_id, @terminal, @pid, @last_seen, @online)
-    ON CONFLICT(agent_name) DO UPDATE SET
+    INSERT INTO agents (session_id, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
+    VALUES (@session_id, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online)
+    ON CONFLICT(session_id) DO UPDATE SET
       agent_type = @agent_type,
       machine = @machine,
       cwd = @cwd,
@@ -141,7 +132,6 @@ export function createStore(dbPath?: string): Store {
       background_processes = @background_processes,
       git_diff = @git_diff,
       conversation_recent = @conversation_recent,
-      session_id = @session_id,
       terminal = @terminal,
       pid = @pid,
       last_seen = @last_seen,
@@ -153,7 +143,7 @@ export function createStore(dbPath?: string): Store {
     "SELECT * FROM agents WHERE cwd LIKE ? ESCAPE '\\'",
   );
   const getAgentStmt = db.prepare(
-    "SELECT * FROM agents WHERE agent_name = ?",
+    "SELECT * FROM agents WHERE session_id = ?",
   );
   const getOnlineAgentsStmt = db.prepare(
     "SELECT * FROM agents WHERE online = 1",
@@ -169,25 +159,25 @@ export function createStore(dbPath?: string): Store {
     "UPDATE messages SET read = 1 WHERE to_agent = ? AND read = 0",
   );
   const markOfflineStmt = db.prepare(
-    "UPDATE agents SET online = 0 WHERE agent_name = ?",
+    "UPDATE agents SET online = 0 WHERE session_id = ?",
   );
   const purgeOldMessagesStmt = db.prepare(
     "DELETE FROM messages WHERE timestamp < ?",
   );
   const touchAgentStmt = db.prepare(
-    "UPDATE agents SET last_seen = ? WHERE agent_name = ?",
+    "UPDATE agents SET last_seen = ? WHERE session_id = ?",
   );
   const subscribeStmt = db.prepare(
-    "INSERT OR IGNORE INTO subscriptions (agent_name, event) VALUES (?, ?)",
+    "INSERT OR IGNORE INTO subscriptions (session_id, event) VALUES (?, ?)",
   );
   const unsubscribeStmt = db.prepare(
-    "DELETE FROM subscriptions WHERE agent_name = ? AND event = ?",
+    "DELETE FROM subscriptions WHERE session_id = ? AND event = ?",
   );
   const getSubscriptionsStmt = db.prepare(
-    "SELECT event FROM subscriptions WHERE agent_name = ?",
+    "SELECT event FROM subscriptions WHERE session_id = ?",
   );
   const getSubscribersStmt = db.prepare(
-    "SELECT agent_name FROM subscriptions WHERE event = ?",
+    "SELECT session_id FROM subscriptions WHERE event = ?",
   );
 
   const insertApiKeyStmt = db.prepare(
@@ -214,7 +204,7 @@ export function createStore(dbPath?: string): Store {
     upsertAgent(agent) {
       const now = Date.now();
       const row = {
-        agent_name: agent.agent_name,
+        session_id: agent.session_id,
         agent_type: agent.agent_type ?? "",
         machine: agent.machine ?? "",
         cwd: agent.cwd ?? "",
@@ -225,7 +215,6 @@ export function createStore(dbPath?: string): Store {
         background_processes: agent.background_processes ?? "[]",
         git_diff: agent.git_diff ?? "",
         conversation_recent: agent.conversation_recent ?? "",
-        session_id: agent.session_id ?? "",
         terminal: agent.terminal ?? "",
         pid: agent.pid ?? 0,
         last_seen: now,
@@ -242,50 +231,50 @@ export function createStore(dbPath?: string): Store {
       return getAgentsStmt.all() as Agent[];
     },
 
-    getAgent(name) {
-      return (getAgentStmt.get(name) as Agent) ?? null;
+    getAgent(sessionId) {
+      return (getAgentStmt.get(sessionId) as Agent) ?? null;
     },
 
     createMessage(from, to, content) {
       createMessageStmt.run(from, to, content, Date.now());
     },
 
-    getUnreadMessages(agentName) {
-      return getUnreadMessagesStmt.all(agentName) as Message[];
+    getUnreadMessages(sessionId) {
+      return getUnreadMessagesStmt.all(sessionId) as Message[];
     },
 
-    markRead(agentName) {
-      markReadStmt.run(agentName);
+    markRead(sessionId) {
+      markReadStmt.run(sessionId);
     },
 
-    markOffline(agentName) {
-      markOfflineStmt.run(agentName);
+    markOffline(sessionId) {
+      markOfflineStmt.run(sessionId);
     },
 
     getOnlineAgents() {
       return getOnlineAgentsStmt.all() as Agent[];
     },
 
-    subscribe(agentName, events) {
+    subscribe(sessionId, events) {
       for (const event of events) {
-        subscribeStmt.run(agentName, event);
+        subscribeStmt.run(sessionId, event);
       }
     },
 
-    unsubscribe(agentName, events) {
+    unsubscribe(sessionId, events) {
       for (const event of events) {
-        unsubscribeStmt.run(agentName, event);
+        unsubscribeStmt.run(sessionId, event);
       }
     },
 
-    getSubscriptions(agentName) {
-      const rows = getSubscriptionsStmt.all(agentName) as { event: string }[];
+    getSubscriptions(sessionId) {
+      const rows = getSubscriptionsStmt.all(sessionId) as { event: string }[];
       return rows.map((r) => r.event as EventType);
     },
 
     getSubscribers(event) {
-      const rows = getSubscribersStmt.all(event) as { agent_name: string }[];
-      return rows.map((r) => r.agent_name);
+      const rows = getSubscribersStmt.all(event) as { session_id: string }[];
+      return rows.map((r) => r.session_id);
     },
 
     purgeOldMessages(maxAgeDays) {
@@ -294,8 +283,8 @@ export function createStore(dbPath?: string): Store {
       return result.changes;
     },
 
-    touchAgent(agentName) {
-      touchAgentStmt.run(Date.now(), agentName);
+    touchAgent(sessionId) {
+      touchAgentStmt.run(Date.now(), sessionId);
     },
 
     addApiKey(key, label) {

@@ -43,11 +43,11 @@ export function startPresenceLoop(
       }
 
       if (shouldMarkOffline) {
-        store.markOffline(agent.agent_name);
+        store.markOffline(agent.session_id);
         const subscribers = store.getSubscribers("agent_offline");
         for (const sub of subscribers) {
-          if (sub !== agent.agent_name) {
-            store.createMessage("system", sub, `${agent.agent_name} went offline`);
+          if (sub !== agent.session_id) {
+            store.createMessage("system", sub, `${agent.session_id} went offline`);
           }
         }
       }

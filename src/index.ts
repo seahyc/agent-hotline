@@ -277,7 +277,7 @@ program
       .filter(Boolean);
 
     const body = {
-      agent_name: opts.agent,
+      session_id: opts.agent,
       agent_type: opts.type,
       machine: hostname(),
       cwd,

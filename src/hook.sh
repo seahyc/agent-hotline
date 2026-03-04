@@ -4,13 +4,9 @@
 #
 # Config: ~/.agent-hotline/config (optional)
 #   HOTLINE_SERVER=http://localhost:3456
-#   HOTLINE_AGENT=my-custom-name
 #   HOTLINE_AUTH_KEY=your-api-key
 #
-# Agent name resolution (first match wins):
-#   1. $HOTLINE_AGENT env var or config
-#   2. tmux session name
-#   3. basename of cwd
+# Agent identity: session_id from Claude Code stdin JSON (required)
 #
 # Agent type detection:
 #   $CLAUDECODE=1 -> claude-code
@@ -42,15 +38,11 @@ if read -t 0.01 -r STDIN_JSON 2>/dev/null; then
 fi
 CWD="${HOOK_CWD:-$(pwd)}"
 
-# Resolve agent name (priority: explicit config > session_id > tmux > basename)
-if [ -z "$HOTLINE_AGENT" ]; then
-  if [ -n "$HOOK_SESSION" ]; then
-    HOTLINE_AGENT="$HOOK_SESSION"
-  elif [ -n "$TMUX" ]; then
-    HOTLINE_AGENT=$(tmux display-message -p '#S' 2>/dev/null)
-  fi
+# session_id is required - bail if not available
+if [ -z "$HOOK_SESSION" ]; then
+  exit 0
 fi
-AGENT="${HOTLINE_AGENT:-$(basename "$CWD")}"
+AGENT="$HOOK_SESSION"
 
 # Detect agent type
 if [ -n "$CLAUDECODE" ]; then
@@ -91,5 +83,5 @@ fi
 hotline_curl -sf --connect-timeout 0.2 --max-time 1 \
   -X POST "$SERVER/api/checkin" \
   -H "Content-Type: application/json" \
-  -d "{\"agent_name\":\"$AGENT\",\"agent_type\":\"$AGENT_TYPE\",\"machine\":\"$(hostname -s)\",\"cwd\":\"$CWD\",\"branch\":\"${BRANCH:-unknown}\",\"cwd_remote\":\"$REMOTE\",\"dirty_files\":$DIRTY_JSON,\"terminal\":\"$TERMINAL_NAME\",\"pid\":$AGENT_PID}" \
+  -d "{\"session_id\":\"$AGENT\",\"agent_type\":\"$AGENT_TYPE\",\"machine\":\"$(hostname -s)\",\"cwd\":\"$CWD\",\"branch\":\"${BRANCH:-unknown}\",\"cwd_remote\":\"$REMOTE\",\"dirty_files\":$DIRTY_JSON,\"terminal\":\"$TERMINAL_NAME\",\"pid\":$AGENT_PID}" \
   >/dev/null 2>&1 || true

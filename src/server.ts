@@ -48,7 +48,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     mcpServer.registerTool("checkin", {
       description: "Push your context to the server",
       inputSchema: {
-        agent_name: z.string().describe("Your unique agent ID (typically your session ID)"),
+        session_id: z.string().describe("Your unique agent/session ID"),
         agent_type: z.string().describe("e.g. claude-code, opencode, codex, cursor, windsurf"),
         machine: z.string(),
         cwd: z.string(),
@@ -68,11 +68,11 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         pid: z.number().optional(),
       },
     }, async (args) => {
-      sessionAgent = args.agent_name;
-      const existing = store.getAgent(args.agent_name);
+      sessionAgent = args.session_id;
+      const existing = store.getAgent(args.session_id);
       const wasOffline = !existing || !existing.online;
       store.upsertAgent({
-        agent_name: args.agent_name,
+        session_id: args.session_id,
         agent_type: args.agent_type,
         machine: args.machine,
         cwd: args.cwd,
@@ -83,17 +83,16 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         background_processes: args.background_processes ? JSON.stringify(args.background_processes) : "[]",
         git_diff: args.git_diff ?? "",
         conversation_recent: args.conversation_recent ?? "",
-        session_id: "",
         terminal: args.terminal ?? "",
         pid: args.pid ?? 0,
       });
       if (wasOffline) {
-        log("info", `mcp checkin ${args.agent_name} (${args.machine}, ${args.cwd}) - came online`);
-        notifySubscribers(store, "agent_online", args.agent_name,
-          `${args.agent_name} is now online (${args.machine}, ${args.cwd})`);
+        log("info", `mcp checkin ${args.session_id} (${args.machine}, ${args.cwd}) - came online`);
+        notifySubscribers(store, "agent_online", args.session_id,
+          `${args.session_id} is now online (${args.machine}, ${args.cwd})`);
       }
       return {
-        content: [{ type: "text", text: `Checked in as ${args.agent_name}` }],
+        content: [{ type: "text", text: `Checked in as ${args.session_id}` }],
       };
     });
 
@@ -111,7 +110,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         agents = agents.filter((a) => a.cwd.toLowerCase().includes(filter));
       }
       const list = agents.map((a) => ({
-        id: a.agent_name,
+        id: a.session_id,
         type: a.agent_type,
         machine: a.machine,
         cwd: a.cwd,
@@ -149,8 +148,8 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         const agents = store.getOnlineAgents();
         let count = 0;
         for (const a of agents) {
-          if (a.agent_name !== args.from) {
-            store.createMessage(args.from, a.agent_name, args.content);
+          if (a.session_id !== args.from) {
+            store.createMessage(args.from, a.session_id, args.content);
             count++;
           }
         }
@@ -486,11 +485,11 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
   // ── REST API (for CLI watch/check commands) ──
 
-  // GET /api/inbox/:agentName - returns unread messages and marks them read
-  app.get("/api/inbox/:agentName", (req, res) => {
-    const { agentName } = req.params;
-    const messages = store.getUnreadMessages(agentName);
-    store.markRead(agentName);
+  // GET /api/inbox/:sessionId - returns unread messages and marks them read
+  app.get("/api/inbox/:sessionId", (req, res) => {
+    const { sessionId } = req.params;
+    const messages = store.getUnreadMessages(sessionId);
+    store.markRead(sessionId);
     res.json(messages);
   });
 
@@ -503,14 +502,14 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
   // POST /api/checkin - register/update an agent via REST
   app.post("/api/checkin", (req, res) => {
     const body = req.body;
-    if (!body?.agent_name) {
-      res.status(400).json({ error: "agent_name is required" });
+    if (!body?.session_id) {
+      res.status(400).json({ error: "session_id is required" });
       return;
     }
-    const existing = store.getAgent(body.agent_name);
+    const existing = store.getAgent(body.session_id);
     const wasOffline = !existing || !existing.online;
     store.upsertAgent({
-      agent_name: body.agent_name,
+      session_id: body.session_id,
       agent_type: body.agent_type ?? "",
       machine: body.machine ?? "",
       cwd: body.cwd ?? "",
@@ -521,29 +520,28 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       background_processes: body.background_processes ? JSON.stringify(body.background_processes) : "[]",
       git_diff: body.git_diff ?? "",
       conversation_recent: body.conversation_recent ?? "",
-      session_id: "",
       terminal: body.terminal ?? "",
       pid: body.pid ?? 0,
     });
     if (wasOffline) {
-      log("info", `checkin ${body.agent_name} (${body.machine ?? "unknown"}, ${body.cwd ?? ""}) - came online`);
-      notifySubscribers(store, "agent_online", body.agent_name,
-        `${body.agent_name} is now online (${body.machine ?? "unknown"}, ${body.cwd ?? ""})`);
+      log("info", `checkin ${body.session_id} (${body.machine ?? "unknown"}, ${body.cwd ?? ""}) - came online`);
+      notifySubscribers(store, "agent_online", body.session_id,
+        `${body.session_id} is now online (${body.machine ?? "unknown"}, ${body.cwd ?? ""})`);
     }
-    res.json({ ok: true, agent_name: body.agent_name });
+    res.json({ ok: true, session_id: body.session_id });
   });
 
   // POST /api/checkout - mark agent offline via REST
   app.post("/api/checkout", (req, res) => {
-    const { agent_name } = req.body;
-    if (!agent_name) {
-      res.status(400).json({ error: "agent_name is required" });
+    const { session_id } = req.body;
+    if (!session_id) {
+      res.status(400).json({ error: "session_id is required" });
       return;
     }
-    log("info", `checkout ${agent_name} - went offline`);
-    store.markOffline(agent_name);
-    notifySubscribers(store, "agent_offline", agent_name, `${agent_name} went offline`);
-    res.json({ ok: true, agent_name });
+    log("info", `checkout ${session_id} - went offline`);
+    store.markOffline(session_id);
+    notifySubscribers(store, "agent_offline", session_id, `${session_id} went offline`);
+    res.json({ ok: true, session_id });
   });
 
   // POST /api/invite - generate an invite code (requires master key)
@@ -591,8 +589,8 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       const agents = store.getOnlineAgents();
       let count = 0;
       for (const a of agents) {
-        if (a.agent_name !== from) {
-          store.createMessage(from, a.agent_name, content);
+        if (a.session_id !== from) {
+          store.createMessage(from, a.session_id, content);
           count++;
         }
       }

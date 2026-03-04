@@ -16,7 +16,7 @@ function isProcessAlive(pid: number): boolean {
 export function createClientServer(opts: { hubUrl: string; authKey: string; port: number }) {
   const { hubUrl, authKey, port } = opts;
   const app = express();
-  const pidMap = new Map<string, number>(); // agent_name -> pid
+  const pidMap = new Map<string, number>(); // session_id -> pid
 
   // Parse JSON bodies for intercepting checkin/checkout
   app.use(express.json({ limit: "10mb" }));
@@ -50,8 +50,8 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
   // ── Intercept checkin to track PIDs ──
   app.post("/api/checkin", async (req, res) => {
     const body = req.body;
-    if (body?.agent_name && body?.pid) {
-      pidMap.set(body.agent_name, body.pid);
+    if (body?.session_id && body?.pid) {
+      pidMap.set(body.session_id, body.pid);
     }
     try {
       const upstream = await fetch(`${hubUrl}/api/checkin`, {
@@ -69,8 +69,8 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
   // ── Intercept checkout to untrack PIDs ──
   app.post("/api/checkout", async (req, res) => {
     const body = req.body;
-    if (body?.agent_name) {
-      pidMap.delete(body.agent_name);
+    if (body?.session_id) {
+      pidMap.delete(body.session_id);
     }
     try {
       const upstream = await fetch(`${hubUrl}/api/checkout`, {
@@ -168,15 +168,15 @@ export function createClientServer(opts: { hubUrl: string; authKey: string; port
 
   // ── PID monitor: check every 10s ──
   const pidCheckTimer = setInterval(async () => {
-    for (const [agentName, pid] of pidMap) {
+    for (const [sessionId, pid] of pidMap) {
       if (!isProcessAlive(pid)) {
-        pidMap.delete(agentName);
+        pidMap.delete(sessionId);
         // Notify hub that agent is offline
         try {
           await fetch(`${hubUrl}/api/checkout`, {
             method: "POST",
             headers: hubHeaders({ "Content-Type": "application/json" }),
-            body: JSON.stringify({ agent_name: agentName }),
+            body: JSON.stringify({ session_id: sessionId }),
           });
         } catch {
           // Hub unreachable, will retry or hub's own presence will catch it
