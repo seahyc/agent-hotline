@@ -69,7 +69,7 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
   }
   const hooks = config.hooks as Record<string, unknown>;
 
-  const hookCommand = `agent-hotline check --agent ${agentName} --format inline --quiet --server ${serverUrl} 2>/dev/null || true`;
+  const hookCommand = `agent-hotline checkin --agent ${agentName} --server ${serverUrl} --quiet 2>/dev/null; agent-hotline check --agent ${agentName} --format inline --quiet --server ${serverUrl} 2>/dev/null || true`;
 
   const desiredHookEntry = {
     matcher: "",

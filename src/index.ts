@@ -7,7 +7,9 @@ import { startPresenceLoop } from "./presence.js";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { exec } from "node:child_process";
+import { exec, execSync } from "node:child_process";
+import { hostname } from "node:os";
+import { basename } from "node:path";
 import type { Message } from "./store.js";
 
 // ── ANSI colors ──
@@ -139,6 +141,61 @@ program
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
+  });
+
+// ── checkin ──
+function shell(cmd: string): string {
+  try {
+    return execSync(cmd, { encoding: "utf-8", timeout: 5000 }).trim();
+  } catch {
+    return "";
+  }
+}
+
+program
+  .command("checkin")
+  .description("Register this agent with the hotline server (auto-gathers git context)")
+  .requiredOption("--agent <name>", "Agent name")
+  .option("--server <url>", "Server URL", "http://localhost:3456")
+  .option("--type <type>", "Agent type", "claude-code")
+  .option("--status <status>", "What you're working on", "active")
+  .option("--quiet", "No output on success")
+  .action(async (opts) => {
+    const cwd = process.cwd();
+    const branch = shell("git branch --show-current");
+    const cwdRemote = shell("git remote get-url origin");
+    const dirtyFiles = shell("git diff --name-only && git diff --staged --name-only")
+      .split("\n")
+      .filter(Boolean);
+
+    const body = {
+      agent_name: opts.agent,
+      agent_type: opts.type,
+      machine: hostname(),
+      cwd,
+      cwd_remote: cwdRemote,
+      branch: branch || "unknown",
+      status: opts.status,
+      dirty_files: dirtyFiles,
+    };
+
+    try {
+      const res = await fetch(`${opts.server}/api/checkin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        if (!opts.quiet) console.error(`Checkin failed: ${res.status}`);
+        process.exit(1);
+      }
+      if (!opts.quiet) {
+        console.log(`Checked in as ${opts.agent} (${cwd}, ${branch || "no branch"})`);
+      }
+    } catch {
+      if (!opts.quiet) console.error("Could not connect to server.");
+    }
+    process.exit(0);
   });
 
 // ── check ──
