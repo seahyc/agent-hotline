@@ -26,7 +26,8 @@ At the START of each session:
 1. Call \`who\` to see other online agents.
 2. Call \`inbox\` to read unread messages.
 3. Call \`listen\` and run the returned command in background to receive messages in real-time.
-IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.`;
+IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.
+You MUST always have a listener running. Every time you process a message, immediately call \`listen\` again. Never leave yourself without a listener.`;
 
 export function createServer(store: Store, opts?: { authKey?: string; port?: number }) {
   // Auth is always enforced. Auto-generate a master key if none provided.
@@ -253,7 +254,8 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       description: [
         "Get a background polling command that watches your inbox and exits when a message arrives.",
         "Run the returned command as a background process. When it exits, you will be woken up with the message.",
-        "IMPORTANT: After processing the message, call `listen` again to resume monitoring.",
+        "CRITICAL: After processing the message, you MUST call `listen` again immediately to resume monitoring.",
+        "Never leave yourself without a running listener - call `listen` again every single time.",
       ].join(" "),
       inputSchema: {
         poll_interval: z.number().optional().default(3),
@@ -264,13 +266,8 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       const cmd = [
         `AGENT="${id}"`,
         `SERVER="${serverUrl}"`,
-        `PIDFILE=~/.agent-hotline/poller-$AGENT.pid`,
         `[ -f ~/.agent-hotline/config ] && . ~/.agent-hotline/config`,
         `hcurl() { if [ -n "$HOTLINE_AUTH_KEY" ]; then curl -H "Authorization: Bearer $HOTLINE_AUTH_KEY" "$@"; else curl "$@"; fi; }`,
-        // Kill existing poller if running
-        `if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then kill "$(cat "$PIDFILE")" 2>/dev/null; fi`,
-        `echo $$ > "$PIDFILE"`,
-        `trap 'rm -f "$PIDFILE"' EXIT`,
         `while true; do`,
         `  MSGS=$(hcurl -sf "$SERVER/api/inbox/$AGENT" 2>/dev/null)`,
         `  if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ]; then`,
@@ -281,7 +278,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         `done`,
       ].join("; ");
       return {
-        content: [{ type: "text", text: `Run this command in the background to listen for messages:\n\n${cmd}\n\nWhen this exits with a message, process it and call \`listen\` again to resume.` }],
+        content: [{ type: "text", text: `Run this command in the background to listen for messages:\n\n${cmd}\n\nWhen this exits with a message, process it then IMMEDIATELY call \`listen\` again. You must ALWAYS have a listener running.` }],
       };
     });
 
