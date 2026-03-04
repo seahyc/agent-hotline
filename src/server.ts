@@ -273,7 +273,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         `  fi`,
         `  sleep ${args.poll_interval}`,
         `done`,
-      ].join("; ");
+      ].join("\n");
       return {
         content: [{ type: "text", text: `Run this command in the background to listen for messages:\n\n${cmd}\n\nWhen this exits with a message, process it then IMMEDIATELY call \`listen\` again. You must ALWAYS have a listener running.` }],
       };
