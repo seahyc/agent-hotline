@@ -47,8 +47,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
       // Resolve identity: PID-based > auto-generate
       let resolvedId: string | undefined;
+      let wasResolved = false;
       if (clientPid) {
         resolvedId = resolveSessionId(clientPid, store) ?? undefined;
+        if (resolvedId) wasResolved = true;
       }
       if (!resolvedId) {
         resolvedId = randomUUID();
@@ -59,11 +61,20 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       const existing = store.getAgent(resolvedId);
       const wasOffline = !existing || !existing.online;
 
-      // Minimal upsert - context is pulled on demand via resolveContext
-      store.upsertAgent({
-        session_id: resolvedId,
-        pid: clientPid ?? 0,
-      });
+      // If resolved from DB, don't overwrite the hook-registered PID -
+      // the hook's PID (the actual agent process) is the authoritative one.
+      // Only set PID for newly generated agents.
+      if (wasResolved && existing) {
+        store.touchAgent(resolvedId);
+        if (!existing.online) {
+          store.upsertAgent({ session_id: resolvedId, pid: existing.pid });
+        }
+      } else {
+        store.upsertAgent({
+          session_id: resolvedId,
+          pid: clientPid ?? 0,
+        });
+      }
 
       if (wasOffline) {
         log("info", `auto-register ${resolvedId} (PID ${clientPid}) - came online`);
@@ -141,6 +152,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       const list = filtered.map(({ agent: a, live }) => {
         return {
           id: a.session_id,
+          me: a.session_id === sessionAgent || undefined,
           type: live?.agent_type || a.agent_type || undefined,
           machine: live?.machine || a.machine || undefined,
           cwd: live?.cwd || a.cwd || undefined,
