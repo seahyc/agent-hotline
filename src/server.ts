@@ -57,7 +57,7 @@ export function createServer(store: Store) {
 
     // ── Tool: who ──
     mcpServer.registerTool("who", {
-      description: "See online agents",
+      description: "See online agents. Optionally filter by `room` (substring matched against agents' cwd).",
       inputSchema: {
         room: z.string().optional(),
       },
@@ -71,7 +71,7 @@ export function createServer(store: Store) {
         cwd_remote: a.cwd_remote,
         branch: a.branch,
         status: a.status,
-        dirty_files: a.dirty_files,
+        dirty_files: JSON.parse(a.dirty_files || "[]"),
         last_seen: a.last_seen,
         online: a.online,
       }));
@@ -245,7 +245,7 @@ export function createServer(store: Store) {
         res.status(400).json({
           jsonrpc: "2.0",
           error: { code: -32000, message: "Bad Request: No valid session ID provided" },
-          id: null,
+          id: req.body?.id ?? null,
         });
         return;
       }
@@ -256,7 +256,7 @@ export function createServer(store: Store) {
         res.status(500).json({
           jsonrpc: "2.0",
           error: { code: -32603, message: "Internal server error" },
-          id: null,
+          id: req.body?.id ?? null,
         });
       }
     }
