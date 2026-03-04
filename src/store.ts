@@ -8,7 +8,8 @@ export interface Agent {
   cwd_remote: string;
   branch: string;
   status: string;
-  dirty_files: string; // JSON array
+  dirty_files: string; // JSON array of file paths
+  background_processes: string; // JSON array of {pid, port?, command, description}
   git_diff: string;
   conversation_recent: string;
   last_seen: number; // unix ms
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS agents (
   branch TEXT DEFAULT '',
   status TEXT DEFAULT '',
   dirty_files TEXT DEFAULT '[]',
+  background_processes TEXT DEFAULT '[]',
   git_diff TEXT DEFAULT '',
   conversation_recent TEXT DEFAULT '',
   last_seen INTEGER DEFAULT 0,
@@ -74,8 +76,8 @@ export function createStore(dbPath?: string): Store {
   db.exec(CREATE_MESSAGES_INDEX);
 
   const upsertAgentStmt = db.prepare(`
-    INSERT INTO agents (agent_name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, git_diff, conversation_recent, last_seen, online)
-    VALUES (@agent_name, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @git_diff, @conversation_recent, @last_seen, @online)
+    INSERT INTO agents (agent_name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, last_seen, online)
+    VALUES (@agent_name, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @last_seen, @online)
     ON CONFLICT(agent_name) DO UPDATE SET
       agent_type = @agent_type,
       machine = @machine,
@@ -84,6 +86,7 @@ export function createStore(dbPath?: string): Store {
       branch = @branch,
       status = @status,
       dirty_files = @dirty_files,
+      background_processes = @background_processes,
       git_diff = @git_diff,
       conversation_recent = @conversation_recent,
       last_seen = @last_seen,
@@ -130,6 +133,7 @@ export function createStore(dbPath?: string): Store {
         branch: agent.branch ?? "",
         status: agent.status ?? "",
         dirty_files: agent.dirty_files ?? "[]",
+        background_processes: agent.background_processes ?? "[]",
         git_diff: agent.git_diff ?? "",
         conversation_recent: agent.conversation_recent ?? "",
         last_seen: now,

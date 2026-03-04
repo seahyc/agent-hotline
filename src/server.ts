@@ -8,10 +8,11 @@ import type { Store } from "./store.js";
 
 const INSTRUCTIONS = `Agent Hotline - Cross-machine agent communication.
 At the START of each session:
-1. Call \`checkin\` with your current status, cwd, branch, and files.
-2. Call \`who\` to see other online agents.
+1. Call \`checkin\` with your current status, cwd, branch, files, and background processes (pid, port, command, description).
+2. Call \`who\` to see other online agents and their background processes (to avoid port conflicts).
 3. Read your inbox for unread messages.
-When your status changes significantly, call \`checkin\` again.`;
+When your status changes significantly, call \`checkin\` again.
+Before starting a process on a port, check \`who\` to see if another agent already uses that port.`;
 
 export function createServer(store: Store) {
   const transports: Record<string, StreamableHTTPServerTransport> = {};
@@ -34,6 +35,12 @@ export function createServer(store: Store) {
         branch: z.string(),
         status: z.string(),
         dirty_files: z.array(z.string()).optional(),
+        background_processes: z.array(z.object({
+          pid: z.number(),
+          port: z.number().optional(),
+          command: z.string(),
+          description: z.string(),
+        })).optional(),
         git_diff: z.string().optional(),
         conversation_recent: z.string().optional(),
       },
@@ -47,6 +54,7 @@ export function createServer(store: Store) {
         branch: args.branch,
         status: args.status,
         dirty_files: args.dirty_files ? JSON.stringify(args.dirty_files) : "[]",
+        background_processes: args.background_processes ? JSON.stringify(args.background_processes) : "[]",
         git_diff: args.git_diff ?? "",
         conversation_recent: args.conversation_recent ?? "",
       });
@@ -72,6 +80,7 @@ export function createServer(store: Store) {
         branch: a.branch,
         status: a.status,
         dirty_files: JSON.parse(a.dirty_files || "[]"),
+        background_processes: JSON.parse(a.background_processes || "[]"),
         last_seen: a.last_seen,
         online: a.online,
       }));
