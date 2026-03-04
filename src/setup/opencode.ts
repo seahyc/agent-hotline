@@ -31,10 +31,10 @@ export function setupOpenCode(agentName: string, serverUrl: string): void {
     url: `${serverUrl}/mcp`,
   };
 
-  const existing = mcp["agent-hotline"] as Record<string, unknown> | undefined;
+  const existing = mcp["hotline"] as Record<string, unknown> | undefined;
   if (!existing || existing.url !== desiredMcp.url || existing.type !== desiredMcp.type) {
-    mcp["agent-hotline"] = desiredMcp;
-    changes.push("mcp.agent-hotline");
+    mcp["hotline"] = desiredMcp;
+    changes.push("mcp.hotline");
   }
 
   writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");

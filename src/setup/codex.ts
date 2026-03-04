@@ -22,7 +22,7 @@ export function setupCodex(agentName: string, serverUrl: string): void {
   }
 
   // Check if already configured
-  if (content.includes("[mcp_servers.agent-hotline]")) {
+  if (content.includes("[mcp_servers.hotline]")) {
     console.log(`${DIM}Already configured - no changes needed.${RESET}`);
     console.log(`${DIM}File: ${configPath}${RESET}`);
     return;
@@ -30,7 +30,7 @@ export function setupCodex(agentName: string, serverUrl: string): void {
 
   const block = [
     "",
-    "[mcp_servers.agent-hotline]",
+    "[mcp_servers.hotline]",
     'type = "url"',
     `url = "${serverUrl}/mcp"`,
     "",
@@ -43,7 +43,7 @@ export function setupCodex(agentName: string, serverUrl: string): void {
   console.log(`${GREEN}${BOLD}Configured Codex${RESET}`);
   console.log(`${DIM}File: ${configPath}${RESET}`);
   console.log();
-  console.log(`  ${YELLOW}+${RESET} mcp_servers.agent-hotline`);
+  console.log(`  ${YELLOW}+${RESET} mcp_servers.hotline`);
   console.log();
   console.log(
     `${DIM}Agent name "${agentName}" is not embedded in codex config.${RESET}`,

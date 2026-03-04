@@ -19,7 +19,7 @@ export function createServer(store: Store) {
 
   const getServer = () => {
     const mcpServer = new McpServer(
-      { name: "agent-hotline", version: "0.1.0" },
+      { name: "hotline", version: "0.1.0" },
       { instructions: INSTRUCTIONS },
     );
 

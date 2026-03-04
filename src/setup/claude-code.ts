@@ -64,10 +64,10 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
         mcpickConfig = { servers: [] };
       }
     }
-    const hasEntry = mcpickConfig.servers.some((s) => s.name === "agent-hotline");
+    const hasEntry = mcpickConfig.servers.some((s) => s.name === "hotline" || s.name === "agent-hotline");
     if (!hasEntry) {
       mcpickConfig.servers.push({
-        name: "agent-hotline",
+        name: "hotline",
         type: "http",
         url: `${serverUrl}/mcp`,
       });
@@ -81,9 +81,9 @@ export function setupClaudeCode(agentName: string, serverUrl: string): void {
     }
     const mcpServers = config.mcpServers as Record<string, unknown>;
     const desiredMcp = { type: "url", url: `${serverUrl}/mcp` };
-    const existing = mcpServers["agent-hotline"] as Record<string, unknown> | undefined;
+    const existing = mcpServers["hotline"] as Record<string, unknown> | undefined;
     if (!existing || existing.url !== desiredMcp.url || existing.type !== desiredMcp.type) {
-      mcpServers["agent-hotline"] = desiredMcp;
+      mcpServers["hotline"] = desiredMcp;
       changes.push("mcpServers.agent-hotline");
     }
   }
