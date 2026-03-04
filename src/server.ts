@@ -46,9 +46,9 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
     // ── Tool: checkin ──
     mcpServer.registerTool("checkin", {
-      description: "Push your context to the server. agent_name defaults to session_id if not provided.",
+      description: "Push your context to the server",
       inputSchema: {
-        agent_name: z.string().optional().describe("Display name. Defaults to session_id if omitted."),
+        agent_name: z.string().describe("Your unique agent ID (typically your session ID)"),
         agent_type: z.string().describe("e.g. claude-code, opencode, codex, cursor, windsurf"),
         machine: z.string(),
         cwd: z.string(),
@@ -64,23 +64,15 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         })).optional(),
         git_diff: z.string().optional(),
         conversation_recent: z.string().optional(),
-        session_id: z.string().optional(),
         terminal: z.string().optional(),
         pid: z.number().optional(),
       },
     }, async (args) => {
-      const agentName = args.agent_name || args.session_id;
-      if (!agentName) {
-        return {
-          content: [{ type: "text", text: "Error: agent_name or session_id is required" }],
-          isError: true,
-        };
-      }
-      sessionAgent = agentName;
-      const existing = store.getAgent(agentName);
+      sessionAgent = args.agent_name;
+      const existing = store.getAgent(args.agent_name);
       const wasOffline = !existing || !existing.online;
       store.upsertAgent({
-        agent_name: agentName,
+        agent_name: args.agent_name,
         agent_type: args.agent_type,
         machine: args.machine,
         cwd: args.cwd,
@@ -91,17 +83,17 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         background_processes: args.background_processes ? JSON.stringify(args.background_processes) : "[]",
         git_diff: args.git_diff ?? "",
         conversation_recent: args.conversation_recent ?? "",
-        session_id: args.session_id ?? "",
+        session_id: "",
         terminal: args.terminal ?? "",
         pid: args.pid ?? 0,
       });
       if (wasOffline) {
-        log("info", `mcp checkin ${agentName} (${args.machine}, ${args.cwd}) - came online`);
-        notifySubscribers(store, "agent_online", agentName,
-          `${agentName} is now online (${args.machine}, ${args.cwd})`);
+        log("info", `mcp checkin ${args.agent_name} (${args.machine}, ${args.cwd}) - came online`);
+        notifySubscribers(store, "agent_online", args.agent_name,
+          `${args.agent_name} is now online (${args.machine}, ${args.cwd})`);
       }
       return {
-        content: [{ type: "text", text: `Checked in as ${agentName}` }],
+        content: [{ type: "text", text: `Checked in as ${args.agent_name}` }],
       };
     });
 
@@ -119,7 +111,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         agents = agents.filter((a) => a.cwd.toLowerCase().includes(filter));
       }
       const list = agents.map((a) => ({
-        name: a.agent_name,
+        id: a.agent_name,
         type: a.agent_type,
         machine: a.machine,
         cwd: a.cwd,
@@ -128,7 +120,6 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         status: a.status,
         dirty_files: JSON.parse(a.dirty_files || "[]"),
         background_processes: JSON.parse(a.background_processes || "[]"),
-        session_id: a.session_id || undefined,
         terminal: a.terminal || undefined,
         pid: a.pid || undefined,
         last_seen: a.last_seen,
@@ -530,7 +521,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       background_processes: body.background_processes ? JSON.stringify(body.background_processes) : "[]",
       git_diff: body.git_diff ?? "",
       conversation_recent: body.conversation_recent ?? "",
-      session_id: body.session_id ?? "",
+      session_id: "",
       terminal: body.terminal ?? "",
       pid: body.pid ?? 0,
     });
