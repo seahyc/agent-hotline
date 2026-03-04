@@ -310,5 +310,21 @@ export function createServer(store: Store) {
     res.json({ status: "ok" });
   });
 
+  // ── REST API (for CLI watch/check commands) ──
+
+  // GET /api/inbox/:agentName - returns unread messages and marks them read
+  app.get("/api/inbox/:agentName", (req, res) => {
+    const { agentName } = req.params;
+    const messages = store.getUnreadMessages(agentName);
+    store.markRead(agentName);
+    res.json(messages);
+  });
+
+  // GET /api/agents - returns all agents
+  app.get("/api/agents", (_req, res) => {
+    const agents = store.getAgents();
+    res.json(agents);
+  });
+
   return { app, getServer, transports };
 }
