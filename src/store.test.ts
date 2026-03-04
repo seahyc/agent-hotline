@@ -74,6 +74,30 @@ describe("store", () => {
     });
   });
 
+  describe("getAgentByPid", () => {
+    it("returns online agent with matching PID", () => {
+      store.upsertAgent({ session_id: "alice", pid: 12345 });
+      const agent = store.getAgentByPid(12345);
+      expect(agent).not.toBeNull();
+      expect(agent!.session_id).toBe("alice");
+    });
+
+    it("returns null for offline agent with matching PID", () => {
+      store.upsertAgent({ session_id: "alice", pid: 12345 });
+      store.markOffline("alice");
+      expect(store.getAgentByPid(12345)).toBeNull();
+    });
+
+    it("returns null for unknown PID", () => {
+      expect(store.getAgentByPid(99999)).toBeNull();
+    });
+
+    it("returns null for PID 0", () => {
+      store.upsertAgent({ session_id: "alice", pid: 0 });
+      expect(store.getAgentByPid(0)).toBeNull();
+    });
+  });
+
   describe("messages", () => {
     it("creates and retrieves unread messages", () => {
       store.createMessage("alice", "bob", "hey bob");

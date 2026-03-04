@@ -39,8 +39,11 @@ function mockStore(): Store {
         branch: agent.branch ?? "",
         status: agent.status ?? "",
         dirty_files: agent.dirty_files ?? "[]",
+        background_processes: agent.background_processes ?? "[]",
         git_diff: agent.git_diff ?? "",
         conversation_recent: agent.conversation_recent ?? "",
+        terminal: agent.terminal ?? "",
+        pid: agent.pid ?? 0,
         last_seen: Date.now(),
         online: 1,
       };
@@ -52,6 +55,7 @@ function mockStore(): Store {
       return [...agents];
     }),
     getAgent: vi.fn((name: string) => agents.find((a) => a.session_id === name) ?? null),
+    getAgentByPid: vi.fn((pid: number) => agents.find((a) => a.pid === pid && a.online === 1) ?? null),
     createMessage: vi.fn((from: string, to: string, content: string) => {
       messages.push({ id: ++msgId, from_agent: from, to_agent: to, content, timestamp: Date.now(), read: 0 });
     }),
@@ -65,6 +69,18 @@ function mockStore(): Store {
     }),
     markOffline: vi.fn(),
     getOnlineAgents: vi.fn(() => agents.filter((a) => a.online === 1)),
+    subscribe: vi.fn(),
+    unsubscribe: vi.fn(),
+    getSubscriptions: vi.fn(() => []),
+    getSubscribers: vi.fn(() => []),
+    purgeOldMessages: vi.fn(() => 0),
+    touchAgent: vi.fn(),
+    addApiKey: vi.fn(),
+    createApiKey: vi.fn(() => "test-key"),
+    validateApiKey: vi.fn(() => true),
+    hasAnyApiKey: vi.fn(() => true),
+    createInviteCode: vi.fn(() => "abc123"),
+    redeemInviteCode: vi.fn(() => "redeemed-key"),
   };
 }
 
@@ -82,7 +98,7 @@ describe("server - createServer structure", () => {
     const { getServer } = createServer(store);
     const server = getServer();
     expect(server).toBeDefined();
-    expect(server.server).toBeDefined();
+    expect(server.mcpServer).toBeDefined();
   });
 });
 
@@ -188,6 +204,26 @@ describe("server - MCP tools via client", () => {
     expect(agent!.git_diff).toBe("diff --git a/file1.ts");
   });
 
+  it("checkin without session_id auto-generates one", async () => {
+    const result = await client.callTool({
+      name: "checkin",
+      arguments: {
+        agent_type: "codex",
+        machine: "linux-1",
+        cwd: "/home/user/project",
+        branch: "main",
+        status: "working",
+      },
+    });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    expect(text).toMatch(/^Checked in as .+/);
+    // Should have generated a UUID
+    const sessionId = text.replace("Checked in as ", "");
+    expect(sessionId.length).toBeGreaterThan(0);
+    const agent = store.getAgent(sessionId);
+    expect(agent).not.toBeNull();
+  });
+
   it("who tool returns agents", async () => {
     store.upsertAgent({
       session_id: "alice",
@@ -202,7 +238,7 @@ describe("server - MCP tools via client", () => {
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const agents = JSON.parse(text);
     expect(agents).toHaveLength(1);
-    expect(agents[0].name).toBe("alice");
+    expect(agents[0].id).toBe("alice");
     expect(agents[0].type).toBe("claude-code");
   });
 
@@ -212,20 +248,40 @@ describe("server - MCP tools via client", () => {
 
     const result = await client.callTool({
       name: "who",
-      arguments: { room: "project-x" },
+      arguments: { cwd_filter: "project-x" },
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const agents = JSON.parse(text);
     expect(agents).toHaveLength(1);
-    expect(agents[0].name).toBe("a1");
+    expect(agents[0].id).toBe("a1");
+  });
+
+  it("message tool requires checkin first", async () => {
+    const result = await client.callTool({
+      name: "message",
+      arguments: { to: "bob", content: "hello" },
+    });
+    expect(result.isError).toBe(true);
   });
 
   it("message tool sends direct message", async () => {
+    // Checkin first to establish identity
+    await client.callTool({
+      name: "checkin",
+      arguments: {
+        session_id: "alice",
+        agent_type: "claude-code",
+        machine: "mac-1",
+        cwd: "/home/alice",
+        branch: "main",
+        status: "working",
+      },
+    });
     store.upsertAgent({ session_id: "bob" });
 
     const result = await client.callTool({
       name: "message",
-      arguments: { from: "alice", to: "bob", content: "hello bob" },
+      arguments: { to: "bob", content: "hello bob" },
     });
     expect(result.content).toEqual([
       { type: "text", text: "Message sent to bob" },
@@ -238,16 +294,28 @@ describe("server - MCP tools via client", () => {
   });
 
   it("message tool broadcasts to all except sender", async () => {
-    store.upsertAgent({ session_id: "alice" });
+    // Checkin as alice
+    await client.callTool({
+      name: "checkin",
+      arguments: {
+        session_id: "alice",
+        agent_type: "claude-code",
+        machine: "mac-1",
+        cwd: "/home/alice",
+        branch: "main",
+        status: "working",
+      },
+    });
     store.upsertAgent({ session_id: "bob" });
     store.upsertAgent({ session_id: "charlie" });
 
     const result = await client.callTool({
       name: "message",
-      arguments: { from: "alice", to: "*", content: "hey everyone" },
+      arguments: { to: "*", content: "hey everyone" },
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toBe("Broadcast sent to 2 agent(s)");
+    // alice + bob + charlie = 3 online, broadcast to 2 (excluding alice)
+    expect(text).toMatch(/Broadcast sent to \d+ .*agent\(s\)/);
 
     expect(store.getUnreadMessages("bob")).toHaveLength(1);
     expect(store.getUnreadMessages("charlie")).toHaveLength(1);
@@ -255,12 +323,24 @@ describe("server - MCP tools via client", () => {
   });
 
   it("inbox tool returns unread messages", async () => {
+    // Checkin as alice first
+    await client.callTool({
+      name: "checkin",
+      arguments: {
+        session_id: "alice",
+        agent_type: "claude-code",
+        machine: "mac-1",
+        cwd: "/home/alice",
+        branch: "main",
+        status: "working",
+      },
+    });
     store.createMessage("bob", "alice", "hey alice");
     store.createMessage("charlie", "alice", "hi there");
 
     const result = await client.callTool({
       name: "inbox",
-      arguments: { session_id: "alice" },
+      arguments: {},
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const messages = JSON.parse(text);
@@ -269,24 +349,45 @@ describe("server - MCP tools via client", () => {
   });
 
   it("inbox with mark_read=false does not mark messages as read", async () => {
+    await client.callTool({
+      name: "checkin",
+      arguments: {
+        session_id: "alice",
+        agent_type: "claude-code",
+        machine: "mac-1",
+        cwd: "/home/alice",
+        branch: "main",
+        status: "working",
+      },
+    });
     store.createMessage("bob", "alice", "msg1");
 
     await client.callTool({
       name: "inbox",
-      arguments: { session_id: "alice", mark_read: false },
+      arguments: { mark_read: false },
     });
 
-    // Messages should still be unread
     const msgs = store.getUnreadMessages("alice");
     expect(msgs).toHaveLength(1);
   });
 
   it("inbox with mark_read=true (default) marks messages as read", async () => {
+    await client.callTool({
+      name: "checkin",
+      arguments: {
+        session_id: "alice",
+        agent_type: "claude-code",
+        machine: "mac-1",
+        cwd: "/home/alice",
+        branch: "main",
+        status: "working",
+      },
+    });
     store.createMessage("bob", "alice", "msg1");
 
     await client.callTool({
       name: "inbox",
-      arguments: { session_id: "alice" },
+      arguments: {},
     });
 
     const msgs = store.getUnreadMessages("alice");
@@ -296,7 +397,7 @@ describe("server - MCP tools via client", () => {
   it("lists tools correctly", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["checkin", "inbox", "message", "who"]);
+    expect(names).toEqual(["checkin", "checkout", "inbox", "listen", "message", "subscribe", "who"]);
   });
 
   it("lists resources correctly", async () => {

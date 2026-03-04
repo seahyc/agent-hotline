@@ -6,6 +6,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Store, EventType } from "./store.js";
 import { log } from "./log.js";
+import { getClientPid } from "./pid.js";
+import { resolveSessionId } from "./identity.js";
 
 /** Deliver an event notification to all subscribers (as inbox messages). */
 function notifySubscribers(store: Store, event: EventType, subjectAgent: string, text: string): void {
@@ -19,7 +21,7 @@ function notifySubscribers(store: Store, event: EventType, subjectAgent: string,
 
 const INSTRUCTIONS = `Agent Hotline - Cross-machine agent communication.
 At the START of each session:
-1. Call \`checkin\` with your status, cwd, branch, files, and background processes.
+1. Call \`checkin\` with your status, cwd, branch, files, and background processes. Your identity is resolved automatically from your connection - no session_id needed.
 2. Call \`who\` to see other online agents.
 3. Call \`inbox\` to read unread messages.
 4. Call \`listen\` and run the returned command in background to receive messages in real-time.
@@ -36,7 +38,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
   }
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  const getServer = () => {
+  const getServer = (clientPid?: number | null) => {
     let sessionAgent: string | null = null;
 
     const mcpServer = new McpServer(
@@ -46,9 +48,9 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
     // ── Tool: checkin ──
     mcpServer.registerTool("checkin", {
-      description: "Push your context to the server",
+      description: "Push your context to the server. Identity is auto-resolved from your connection - no session_id needed. Pass session_id explicitly to override.",
       inputSchema: {
-        session_id: z.string().describe("Your unique agent/session ID"),
+        session_id: z.string().optional().describe("Override auto-resolved identity. Usually not needed."),
         agent_type: z.string().describe("e.g. claude-code, opencode, codex, cursor, windsurf"),
         machine: z.string(),
         cwd: z.string(),
@@ -68,11 +70,24 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         pid: z.number().optional(),
       },
     }, async (args) => {
-      sessionAgent = args.session_id;
-      const existing = store.getAgent(args.session_id);
+      // Resolve session_id: explicit > re-checkin > PID auto-bind > auto-generate
+      let resolvedId = args.session_id;
+      if (!resolvedId && sessionAgent) {
+        resolvedId = sessionAgent;
+      }
+      if (!resolvedId && clientPid) {
+        resolvedId = resolveSessionId(clientPid, store) ?? undefined;
+      }
+      if (!resolvedId) {
+        resolvedId = randomUUID();
+        log("info", `mcp checkin auto-generated session_id: ${resolvedId}`);
+      }
+
+      sessionAgent = resolvedId;
+      const existing = store.getAgent(resolvedId);
       const wasOffline = !existing || !existing.online;
       store.upsertAgent({
-        session_id: args.session_id,
+        session_id: resolvedId,
         agent_type: args.agent_type,
         machine: args.machine,
         cwd: args.cwd,
@@ -84,15 +99,15 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         git_diff: args.git_diff ?? "",
         conversation_recent: args.conversation_recent ?? "",
         terminal: args.terminal ?? "",
-        pid: args.pid ?? 0,
+        pid: args.pid ?? clientPid ?? 0,
       });
       if (wasOffline) {
-        log("info", `mcp checkin ${args.session_id} (${args.machine}, ${args.cwd}) - came online`);
-        notifySubscribers(store, "agent_online", args.session_id,
-          `${args.session_id} is now online (${args.machine}, ${args.cwd})`);
+        log("info", `mcp checkin ${resolvedId} (${args.machine}, ${args.cwd}) - came online`);
+        notifySubscribers(store, "agent_online", resolvedId,
+          `${resolvedId} is now online (${args.machine}, ${args.cwd})`);
       }
       return {
-        content: [{ type: "text", text: `Checked in as ${args.session_id}` }],
+        content: [{ type: "text", text: `Checked in as ${resolvedId}` }],
       };
     });
 
@@ -131,16 +146,15 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
     // ── Tool: message ──
     mcpServer.registerTool("message", {
-      description: "Send a message to another agent (or '*' to broadcast to all online agents)",
+      description: "Send a message to another agent (or '*' to broadcast to all online agents). Must checkin first.",
       inputSchema: {
-        from: z.string(),
         to: z.string(),
         content: z.string(),
       },
     }, async (args) => {
-      if (sessionAgent && args.from !== sessionAgent) {
+      if (!sessionAgent) {
         return {
-          content: [{ type: "text", text: `Error: 'from' must match your checked-in identity (${sessionAgent})` }],
+          content: [{ type: "text", text: "Error: Call checkin first" }],
           isError: true,
         };
       }
@@ -148,18 +162,18 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         const agents = store.getOnlineAgents();
         let count = 0;
         for (const a of agents) {
-          if (a.session_id !== args.from) {
-            store.createMessage(args.from, a.session_id, args.content);
+          if (a.session_id !== sessionAgent) {
+            store.createMessage(sessionAgent, a.session_id, args.content);
             count++;
           }
         }
-        log("info", `mcp broadcast from ${args.from} to ${count} agents`);
+        log("info", `mcp broadcast from ${sessionAgent} to ${count} agents`);
         return {
           content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
         };
       }
-      store.createMessage(args.from, args.to, args.content);
-      log("info", `mcp message ${args.from} -> ${args.to}`);
+      store.createMessage(sessionAgent, args.to, args.content);
+      log("info", `mcp message ${sessionAgent} -> ${args.to}`);
       return {
         content: [{ type: "text", text: `Message sent to ${args.to}` }],
       };
@@ -399,6 +413,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       if (sessionId && transports[sessionId]) {
         transport = transports[sessionId];
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        // Resolve client PID from the TCP socket connection
+        const remotePort = req.socket.remotePort;
+        const clientPid = remotePort ? getClientPid(opts?.port ?? 3456, remotePort) : null;
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid: string) => {
@@ -406,7 +424,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
           },
         });
 
-        const { mcpServer: server, getSessionAgent } = getServer();
+        const { mcpServer: server, getSessionAgent } = getServer(clientPid);
 
         transport.onclose = () => {
           const sid = transport.sessionId;

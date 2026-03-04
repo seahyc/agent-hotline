@@ -35,6 +35,7 @@ export interface Store {
   upsertAgent(agent: Partial<Agent> & { session_id: string }): void;
   getAgents(room?: string): Agent[];
   getAgent(sessionId: string): Agent | null;
+  getAgentByPid(pid: number): Agent | null;
   createMessage(from: string, to: string, content: string): void;
   getUnreadMessages(sessionId: string): Message[];
   markRead(sessionId: string): void;
@@ -148,6 +149,9 @@ export function createStore(dbPath?: string): Store {
   const getOnlineAgentsStmt = db.prepare(
     "SELECT * FROM agents WHERE online = 1",
   );
+  const getAgentByPidStmt = db.prepare(
+    "SELECT * FROM agents WHERE pid = ? AND online = 1 LIMIT 1",
+  );
 
   const createMessageStmt = db.prepare(
     "INSERT INTO messages (from_agent, to_agent, content, timestamp, read) VALUES (?, ?, ?, ?, 0)",
@@ -233,6 +237,11 @@ export function createStore(dbPath?: string): Store {
 
     getAgent(sessionId) {
       return (getAgentStmt.get(sessionId) as Agent) ?? null;
+    },
+
+    getAgentByPid(pid) {
+      if (!pid) return null;
+      return (getAgentByPidStmt.get(pid) as Agent) ?? null;
     },
 
     createMessage(from, to, content) {
