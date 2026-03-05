@@ -42,8 +42,23 @@ export function getClientPid(serverPort: number, remotePort: number): number | n
     if (isNaN(pid) || pid <= 0) return null;
     log("info", `pid resolved: remote port ${remotePort} -> PID ${pid}`);
     return pid;
-  } catch {
-    log("warn", `pid resolution failed for remote port ${remotePort}`);
+  } catch (e) {
+    log("warn", `pid resolution failed for remote port ${remotePort} (${e instanceof Error ? e.message : "unknown"})`);
     return null;
   }
+}
+
+/**
+ * Resolve client PID with a single retry after a short delay.
+ * lsof/ss may not see brand-new connections immediately.
+ */
+export async function getClientPidWithRetry(serverPort: number, remotePort: number): Promise<number | null> {
+  let pid = getClientPid(serverPort, remotePort);
+  if (pid) return pid;
+
+  // Retry once after delay - OS socket table may need time to reflect the connection
+  await new Promise((r) => setTimeout(r, 200));
+  pid = getClientPid(serverPort, remotePort);
+  if (pid) log("info", `pid resolved on retry: remote port ${remotePort} -> PID ${pid}`);
+  return pid;
 }

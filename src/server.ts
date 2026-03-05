@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Store, EventType } from "./store.js";
 import { log } from "./log.js";
-import { getClientPid } from "./pid.js";
+import { getClientPidWithRetry } from "./pid.js";
 import { resolveSessionId } from "./identity.js";
 import { resolveContext, isPidAlive } from "./context.js";
 
@@ -26,6 +26,7 @@ At the START of each session:
 1. Call \`who\` to see other online agents.
 2. Call \`inbox\` to read unread messages.
 3. Call \`listen\` and run the returned command in background to receive messages in real-time.
+   If \`listen\` tells you background listeners aren't supported, call \`inbox\` at the start of every turn instead.
 IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.
 You MUST always have a listener running. Every time you process a message, immediately call \`listen\` again. Never leave yourself without a listener.`;
 
@@ -258,6 +259,19 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       },
     }, async (args) => {
       const id = ensureRegistered();
+
+      // Codex can't wake agents from background processes - guide them to poll inbox instead
+      const ctx = clientPid ? resolveContext(clientPid, id) : null;
+      if (ctx?.agent_type === "codex") {
+        return {
+          content: [{ type: "text", text: [
+            "Background listeners are not supported in Codex (background processes cannot wake the agent).",
+            "Instead, call `inbox` at the START of every turn to check for new messages.",
+            "This is your only way to receive messages - make it a habit.",
+          ].join("\n") }],
+        };
+      }
+
       const serverUrl = `http://localhost:${opts?.port ?? 3456}`;
       // Bake all values directly into the command so it works even when
       // wrapped in subshells (nohup, zsh -c, etc.) by different clients.
@@ -382,7 +396,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // Resolve client PID from the TCP socket connection
         const remotePort = req.socket.remotePort;
-        const clientPid = remotePort ? getClientPid(opts?.port ?? 3456, remotePort) : null;
+        if (!remotePort) {
+          log("warn", `MCP initialize: remotePort unavailable (socket destroyed: ${req.socket.destroyed}, readableEnded: ${req.socket.readableEnded})`);
+        }
+        const clientPid = remotePort ? await getClientPidWithRetry(opts?.port ?? 3456, remotePort) : null;
 
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
