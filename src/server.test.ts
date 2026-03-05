@@ -335,7 +335,7 @@ describe("server - MCP tools via client", () => {
   it("lists tools correctly", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["inbox", "listen", "message", "who"]);
+    expect(names).toEqual(["inbox", "listen", "message", "rename", "who"]);
   });
 
   it("lists resources correctly", async () => {

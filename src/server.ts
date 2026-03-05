@@ -150,6 +150,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       const list = filtered.map(({ agent: a, live }) => {
         return {
           id: a.session_id,
+          name: a.name || undefined,
           me: a.session_id === sessionAgent || undefined,
           type: live?.agent_type || a.agent_type || undefined,
           machine: live?.machine || a.machine || undefined,
@@ -169,9 +170,34 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       };
     });
 
+    // ── Tool: rename ──
+    mcpServer.registerTool("rename", {
+      description: "Set a friendly name for an agent. Names are global and visible to all. Use names instead of UUIDs when sending messages.",
+      inputSchema: {
+        agent: z.string().describe("Session ID or current name of the agent to rename"),
+        name: z.string().describe("Friendly name (letters, digits, hyphens, underscores, max 32 chars)"),
+      },
+    }, async (args) => {
+      ensureRegistered();
+      if (!/^[a-zA-Z0-9_-]+$/.test(args.name) || args.name.length > 32) {
+        return { content: [{ type: "text", text: "Invalid name. Use letters, digits, hyphens, underscores only (max 32 chars)." }] };
+      }
+      const target = store.resolveAgent(args.agent);
+      if (!target) {
+        return { content: [{ type: "text", text: `Agent not found: ${args.agent}` }] };
+      }
+      // Check uniqueness
+      const existing = store.resolveAgent(args.name);
+      if (existing && existing.session_id !== target.session_id) {
+        return { content: [{ type: "text", text: `Name "${args.name}" is already taken by another agent.` }] };
+      }
+      store.renameAgent(target.session_id, args.name);
+      return { content: [{ type: "text", text: `Renamed ${target.session_id} to "${args.name}"` }] };
+    });
+
     // ── Tool: message ──
     mcpServer.registerTool("message", {
-      description: "Send a message to another agent (or '*' to broadcast to all online agents).",
+      description: "Send a message to another agent by name or ID (or '*' to broadcast to all online agents).",
       inputSchema: {
         to: z.string(),
         content: z.string(),
@@ -192,10 +218,12 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
           content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
         };
       }
-      store.createMessage(id, args.to, args.content);
-      log("info", `mcp message ${id} -> ${args.to}`);
+      const resolved = store.resolveAgent(args.to);
+      const target = resolved?.session_id ?? args.to;
+      store.createMessage(id, target, args.content);
+      log("info", `mcp message ${id} -> ${target}`);
       return {
-        content: [{ type: "text", text: `Message sent to ${args.to}` }],
+        content: [{ type: "text", text: `Message sent to ${resolved?.name || target}` }],
       };
     });
 
@@ -237,6 +265,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
       const trimmed = messages.map((m) => ({
         from: m.from_agent,
+        from_name: store.getAgent(m.from_agent)?.name || undefined,
         content: m.content,
         time: new Date(m.timestamp).toISOString(),
         ...(args.status !== "unread" ? { read: !!m.read } : {}),
@@ -567,21 +596,24 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       res.status(400).json({ error: "from, to, and content are required" });
       return;
     }
+    // Resolve names for both from and to
+    const resolvedFrom = store.resolveAgent(from)?.session_id ?? from;
     if (to === "*") {
       const agents = store.getOnlineAgents();
       let count = 0;
       for (const a of agents) {
-        if (a.session_id !== from) {
-          store.createMessage(from, a.session_id, content);
+        if (a.session_id !== resolvedFrom) {
+          store.createMessage(resolvedFrom, a.session_id, content);
           count++;
         }
       }
-      log("info", `message broadcast from ${from} to ${count} agents`);
+      log("info", `message broadcast from ${resolvedFrom} to ${count} agents`);
       res.json({ ok: true, broadcast: count });
     } else {
-      store.createMessage(from, to, content);
-      log("info", `message ${from} -> ${to}`);
-      res.json({ ok: true, to });
+      const resolvedTo = store.resolveAgent(to)?.session_id ?? to;
+      store.createMessage(resolvedFrom, resolvedTo, content);
+      log("info", `message ${resolvedFrom} -> ${resolvedTo}`);
+      res.json({ ok: true, to: resolvedTo });
     }
   });
 

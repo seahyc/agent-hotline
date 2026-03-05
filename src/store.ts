@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 
 export interface Agent {
   session_id: string;
+  name: string;
   agent_type: string;
   machine: string;
   cwd: string;
@@ -36,6 +37,8 @@ export interface Store {
   getAgents(room?: string): Agent[];
   getAgent(sessionId: string): Agent | null;
   getAgentByPid(pid: number): Agent | null;
+  resolveAgent(nameOrId: string): Agent | null;
+  renameAgent(sessionId: string, name: string): void;
   createMessage(from: string, to: string, content: string): void;
   getUnreadMessages(sessionId: string): Message[];
   getMessages(sessionId: string, limit: number, before?: number): Message[];
@@ -56,6 +59,7 @@ export interface Store {
 const CREATE_AGENTS = `
 CREATE TABLE IF NOT EXISTS agents (
   session_id TEXT PRIMARY KEY,
+  name TEXT DEFAULT '',
   agent_type TEXT DEFAULT '',
   machine TEXT DEFAULT '',
   cwd TEXT DEFAULT '',
@@ -111,6 +115,8 @@ export function createStore(dbPath?: string): Store {
   const db = new Database(dbPath ?? "./hotline.db");
   db.pragma("journal_mode = WAL");
   db.exec(CREATE_AGENTS);
+  // Migration: add name column for existing DBs
+  try { db.exec("ALTER TABLE agents ADD COLUMN name TEXT DEFAULT ''"); } catch (_) { /* already exists */ }
   db.exec(CREATE_MESSAGES);
   db.exec(CREATE_MESSAGES_INDEX);
   db.exec(CREATE_SUBSCRIPTIONS);
@@ -118,9 +124,10 @@ export function createStore(dbPath?: string): Store {
   db.exec(CREATE_INVITE_CODES);
 
   const upsertAgentStmt = db.prepare(`
-    INSERT INTO agents (session_id, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
-    VALUES (@session_id, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online)
+    INSERT INTO agents (session_id, name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
+    VALUES (@session_id, @name, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online)
     ON CONFLICT(session_id) DO UPDATE SET
+      name = CASE WHEN @name != '' THEN @name ELSE agents.name END,
       agent_type = @agent_type,
       machine = @machine,
       cwd = @cwd,
@@ -149,6 +156,12 @@ export function createStore(dbPath?: string): Store {
   );
   const getAgentByPidStmt = db.prepare(
     "SELECT * FROM agents WHERE pid = ? AND online = 1 LIMIT 1",
+  );
+  const getAgentByNameStmt = db.prepare(
+    "SELECT * FROM agents WHERE name = ? AND name != '' LIMIT 1",
+  );
+  const renameAgentStmt = db.prepare(
+    "UPDATE agents SET name = ? WHERE session_id = ?",
   );
 
   const createMessageStmt = db.prepare(
@@ -204,6 +217,7 @@ export function createStore(dbPath?: string): Store {
       const now = Date.now();
       const row = {
         session_id: agent.session_id,
+        name: agent.name ?? "",
         agent_type: agent.agent_type ?? "",
         machine: agent.machine ?? "",
         cwd: agent.cwd ?? "",
@@ -237,6 +251,17 @@ export function createStore(dbPath?: string): Store {
     getAgentByPid(pid) {
       if (!pid) return null;
       return (getAgentByPidStmt.get(pid) as Agent) ?? null;
+    },
+
+    resolveAgent(nameOrId) {
+      // Try by name first, then by session_id
+      const byName = (getAgentByNameStmt.get(nameOrId) as Agent) ?? null;
+      if (byName) return byName;
+      return (getAgentStmt.get(nameOrId) as Agent) ?? null;
+    },
+
+    renameAgent(sessionId, name) {
+      renameAgentStmt.run(name, sessionId);
     },
 
     createMessage(from, to, content) {

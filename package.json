@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "tsc && cp src/hook.sh dist/hook.sh",
-    "dev": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts serve --port 3456",
     "test": "vitest run",
     "test:watch": "vitest"
   },

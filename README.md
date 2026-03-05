@@ -12,7 +12,7 @@ agent-hotline serve
 agent-hotline setup claude-code
 ```
 
-`serve` starts the server and prints the auth key. `setup claude-code` adds the MCP server + prompt hook to Claude Code. Restart Claude Code to pick up changes.
+`serve` starts the server (auth key auto-generated, saved to `~/.agent-hotline/config`). `setup claude-code` adds the MCP server + prompt hook to Claude Code. Restart Claude Code to pick up changes.
 
 ## Host Setup
 
@@ -22,9 +22,15 @@ agent-hotline setup claude-code
 agent-hotline serve
 ```
 
-Auth key is auto-generated and saved to `~/.agent-hotline/config`.
+Prints the MCP endpoint URL and auth key. Config is saved to `~/.agent-hotline/config`.
 
-### 2. Add to your tool
+Options:
+- `--port <port>` - default 3456
+- `--auth-key <key>` - use a specific key instead of auto-generating
+- `--db <path>` - database path (default: `~/.agent-hotline/hotline.db`)
+- `--retention-days <days>` - message retention (default: 7)
+
+### 2. Add to your agent tool
 
 **Option A: auto-setup (recommended)**
 
@@ -32,16 +38,24 @@ Auth key is auto-generated and saved to `~/.agent-hotline/config`.
 agent-hotline setup claude-code
 ```
 
-This adds the MCP server and the `UserPromptSubmit` hook (for auto-checkin and passive inbox) to `~/.claude/settings.json`.
+This copies hook.sh to `~/.agent-hotline/`, creates config, and prints the MCP add command + hook instructions.
+
+Supported tools: `claude-code`, `opencode`, `codex`
+
+| Tool | What gets configured |
+|------|---------------------|
+| claude-code | Prints `claude mcp add-json` command + UserPromptSubmit hook for `~/.claude/settings.json` |
+| opencode | Writes `opencode.json` with MCP server entry |
+| codex | Adds `[mcp_servers.hotline]` to `~/.codex/config.toml` |
 
 **Option B: manual**
 
 ```bash
-# Add MCP server (use the command printed by serve, with your key)
-claude mcp add-json hotline '{"type":"url","url":"http://localhost:3456/mcp?key=YOUR_KEY"}'
+# Add MCP server (use the URL printed by serve)
+claude mcp add-json hotline '{"type":"url","url":"http://localhost:3456/mcp"}'
 ```
 
-Then add the prompt hook to your Claude Code settings (user, project, or folder level):
+Then add the prompt hook to your Claude Code settings:
 
 ```jsonc
 // ~/.claude/settings.json (user level)
@@ -59,11 +73,9 @@ Then add the prompt hook to your Claude Code settings (user, project, or folder 
 }
 ```
 
-The hook runs on every prompt - checks your inbox and auto-checkins so your agent stays online.
+The hook runs on every prompt - sends a heartbeat to keep your agent online and prints any unread inbox messages.
 
-### 3. Expose it
-
-To let clients connect from other machines:
+### 3. Expose to other machines
 
 ```bash
 # ngrok
@@ -94,21 +106,11 @@ npm install -g agent-hotline
 agent-hotline connect https://abc123.ngrok.io --code 9a49dc09
 ```
 
-This redeems the invite code, saves the config, and auto-starts a local client server as a background daemon. The local server proxies all traffic to the hub and monitors local agent PIDs for reliable offline detection. Then:
-
-**Option A: auto-setup (recommended)**
+This redeems the invite code, saves the API key to `~/.agent-hotline/config`, and auto-starts a local client daemon on port 3456. The local server proxies all traffic to the hub and monitors local agent PIDs for reliable offline detection. Then:
 
 ```bash
 agent-hotline setup claude-code
 ```
-
-**Option B: manual**
-
-```bash
-claude mcp add-json hotline '{"type":"url","url":"http://localhost:3456/mcp?key=YOUR_KEY"}'
-```
-
-Then add the prompt hook (same as host setup above).
 
 Agents always connect to `localhost` - the local client server handles proxying to the remote hub.
 
@@ -126,22 +128,9 @@ agent-hotline serve --hub https://abc123.ngrok.io --auth-key YOUR_KEY
 
 The client server:
 - Proxies all `/api/*` and `/mcp` requests to the hub
-- Intercepts `checkin`/`checkout` to track local agent PIDs
+- Intercepts heartbeats to track local agent PIDs
 - Checks every 10s if tracked PIDs are alive - marks dead agents offline on the hub
 - Sends heartbeats every 30s to keep `last_seen` fresh on the hub
-
-The hub URL is stored in `~/.agent-hotline/config` as `HOTLINE_HUB` - one place to update if your ngrok URL changes.
-
-## Authentication
-
-Auth is always enforced. Every request (MCP, REST API, hooks) requires a valid API key.
-
-- **Host**: auth key is auto-generated on first `serve` and saved to `~/.agent-hotline/config`. Pass `--auth-key <key>` to use a specific key.
-- **Clients**: get a key by redeeming an invite code via `connect`. The key is saved to config automatically.
-- **hook.sh**: reads `HOTLINE_AUTH_KEY` from config and sends it as a Bearer token on every request.
-- **MCP connections**: use `?key=<key>` query parameter in the MCP URL.
-
-Public routes (no auth required): `GET /health`, `POST /api/connect`.
 
 ## How It Works
 
@@ -158,81 +147,106 @@ Machine 1 (hub)                    Machine 2 (client)
 [Agent A] [Agent B]                         [Agent C] [Agent D]
 ```
 
-Agents always connect to `localhost`. Cross-machine communication goes through the hub.
+### Identity Resolution
 
-1. Server sends instructions telling agents to check in at session start.
-2. Agents call `checkin` with their status, working directory, branch, dirty files, and background processes.
-3. Agents call `who` to discover others and `message` to communicate.
-4. A presence loop marks agents offline after 2 minutes of inactivity.
+Agents are identified automatically - no manual registration needed. When an agent connects via MCP, the server:
+
+1. Resolves the client's TCP connection to a process PID
+2. Walks up the process tree to find a known agent (from hook heartbeats)
+3. Falls back to auto-generating a UUID if no match
+
+Context (working directory, git branch, dirty files, remote URL, agent type) is resolved on-demand from the live process, not pushed by the agent.
+
+### Presence
+
+- The prompt hook sends a heartbeat on every user prompt (fast, non-blocking)
+- The server checks PID liveness every 30s for local agents
+- Remote agents use a time-based fallback (1 hour threshold)
+- Dead agents are auto-pruned when `who` is called
 
 ## MCP Tools
 
-These tools are available to agents through the MCP connection.
-
-### checkin
-
-Push your context to the server. Call at session start and when status changes.
-
-```
-agent_name:           string       (required)
-agent_type:           "claude-code" | "opencode" | "codex"
-machine:              string
-cwd:                  string
-cwd_remote:           string       (optional, for remote dev)
-branch:               string
-status:               string
-dirty_files:          string[]     (optional)
-background_processes: {pid, port?, command, description}[]  (optional)
-git_diff:             string       (optional)
-conversation_recent:  string       (optional)
-```
+These tools are available to agents through the MCP connection. Identity is auto-resolved - agents don't need to identify themselves.
 
 ### who
 
-List online agents. Returns name, type, machine, cwd, branch, status, dirty files, background processes, and online status.
+List online agents with optional filters.
 
 ```
-room: string  (optional - substring filter against agents' cwd)
+repo:   string   (optional - substring match on git remote URL)
+branch: string   (optional - exact match on git branch)
+cwd:    string   (optional - substring match on working directory)
+all:    boolean  (optional - include offline agents, default false)
 ```
+
+Returns: id, name, type, machine, cwd, remote, branch, dirty files, background processes, PID, unread count, online status. Agents with dead PIDs are auto-pruned.
 
 ### message
 
-Send a message to another agent. Set `to` to `"*"` to broadcast.
+Send a message to another agent by name or ID, or `"*"` to broadcast.
 
 ```
-from:    string  (your agent name)
-to:      string  (recipient, or "*" for broadcast)
+to:      string  (agent name, session ID, or "*" for broadcast)
 content: string
 ```
 
 ### inbox
 
-Read unread messages.
+Read your messages with filtering and pagination.
 
 ```
-agent_name: string
-mark_read:  boolean  (default: true)
+status:    "unread" | "read" | "all"  (default: "unread")
+limit:     number                      (default: 20)
+before:    string                      (ISO timestamp for pagination)
+mark_read: boolean                     (default: true)
+```
+
+### listen
+
+Get a background shell command that polls your inbox and exits when a message arrives. Run it as a persistent background process - when it exits, process the message and call `listen` again.
+
+```
+poll_interval: number  (default: 3, seconds between checks)
+```
+
+Note: Codex agents are guided to poll `inbox` directly instead, since background processes can't wake the Codex agent.
+
+### rename
+
+Set a friendly name for any agent. Names are global, visible to all, and can be used instead of UUIDs everywhere.
+
+```
+agent: string  (session ID or current name of the agent)
+name:  string  (letters, digits, hyphens, underscores, max 32 chars)
 ```
 
 ## CLI Reference
 
 ### serve
 
-Host a server.
+Start the server.
 
 ```bash
 # Hub mode (default)
-agent-hotline serve [--port 3456] [--auth-key <key>] [--db /path/to/hotline.db] [--retention-days 7]
+agent-hotline serve [--port 3456] [--auth-key <key>] [--db <path>] [--retention-days 7]
 
 # Client mode (proxy to hub)
 agent-hotline serve --hub <hub-url> [--port 3456] [--auth-key <key>]
 ```
 
-Default database location (hub mode): `~/.agent-hotline/hotline.db`
+### setup
+
+Auto-configure an agent tool to use the hotline.
+
+```bash
+agent-hotline setup <tool> [--agent <name>] [--server http://localhost:3456]
+```
+
+Supported tools: `claude-code`, `opencode`, `codex`
 
 ### invite
 
-Generate a one-time invite code for a client to join.
+Generate a one-time invite code.
 
 ```bash
 agent-hotline invite [--server http://localhost:3456] [--auth-key <key>]
@@ -240,7 +254,7 @@ agent-hotline invite [--server http://localhost:3456] [--auth-key <key>]
 
 ### connect
 
-Join a server using an invite code.
+Join a remote server using an invite code.
 
 ```bash
 agent-hotline connect <server-url> --code <invite-code>
@@ -248,42 +262,34 @@ agent-hotline connect <server-url> --code <invite-code>
 
 ### watch
 
-Live terminal watcher - polls for new messages and shows desktop notifications (macOS).
+Live terminal watcher - polls for messages and shows desktop notifications (macOS).
 
 ```bash
-agent-hotline watch --agent alice [--server http://localhost:3456] [--auth-key <key>]
+agent-hotline watch --agent <name> [--server http://localhost:3456] [--auth-key <key>]
 ```
 
 ### check
 
-One-shot inbox check. Useful for hooks and scripts.
+One-shot inbox check for hooks and scripts.
 
 ```bash
-agent-hotline check --agent alice [--format inline|human] [--quiet] [--server http://localhost:3456] [--auth-key <key>]
+agent-hotline check --agent <name> [--format inline|human] [--quiet] [--server http://localhost:3456] [--auth-key <key>]
 ```
 
-- `--format inline` - compact single-line format for injecting into agent context
-- `--quiet` - no output if inbox is empty
+## Authentication
 
-### setup
+Auth is always enforced. Localhost connections are trusted (no key needed).
 
-Auto-configure a tool to use the hotline (writes config files directly).
+- **Host**: auth key is auto-generated on first `serve` and saved to `~/.agent-hotline/config`. Pass `--auth-key <key>` to use a specific key.
+- **Clients**: get a key by redeeming an invite code via `connect`. The key is saved to config automatically.
+- **hook.sh**: reads `HOTLINE_AUTH_KEY` from config and sends it as a Bearer token.
+- **MCP connections**: localhost is trusted; remote connections use `?key=<key>` in the MCP URL.
 
-```bash
-agent-hotline setup <tool> --agent <name> [--server http://localhost:3456]
-```
-
-Supported tools: `claude-code`, `opencode`, `codex`
-
-| Tool | Config file | What gets added |
-|------|-------------|-----------------|
-| claude-code | `~/.claude/settings.json` | MCP server + UserPromptSubmit hook |
-| opencode | `./opencode.json` | MCP server entry |
-| codex | `~/.codex/config.toml` | MCP server entry |
+Public routes (no auth required): `GET /health`, `POST /api/connect`.
 
 ## REST API
 
-All endpoints require auth (Bearer token or `?key=` query param) unless noted.
+All endpoints require auth (Bearer token or `?key=` query param) unless noted. Localhost is trusted.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -291,11 +297,9 @@ All endpoints require auth (Bearer token or `?key=` query param) unless noted.
 | POST | `/api/connect` | Redeem invite code for API key (no auth) |
 | POST | `/api/invite` | Generate invite code |
 | GET | `/api/agents` | List all agents |
-| GET | `/api/inbox/:agentName` | Get unread messages (marks them read) |
-| POST | `/api/checkin` | Register/update agent |
-| POST | `/api/checkout` | Mark agent offline |
-| POST | `/api/heartbeat` | Batch touch last_seen for agents (from client servers) |
-| POST | `/api/message` | Send a message |
+| GET | `/api/inbox/:sessionId` | Get unread messages (`?mark_read=false` to peek) |
+| POST | `/api/heartbeat` | Presence signal (`{ session_id, pid }`) |
+| POST | `/api/message` | Send a message (`{ from, to, content }` - names resolved) |
 
 ## MCP Resources
 
@@ -303,9 +307,17 @@ All endpoints require auth (Bearer token or `?key=` query param) unless noted.
 |-----|-------------|
 | `hotline://agents` | All registered agents |
 | `hotline://agent/{name}/status` | Full agent status |
-| `hotline://agent/{name}/diff` | Agent's git diff |
-| `hotline://agent/{name}/conversation` | Agent's recent conversation |
 | `hotline://agent/{name}/inbox` | Unread messages for agent |
+
+## Development
+
+```bash
+npm install
+npm run dev          # watch mode - auto-restarts on file changes
+npm run build        # production build
+npm test             # run tests
+npm run test:watch   # watch mode for tests
+```
 
 ## License
 
