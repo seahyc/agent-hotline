@@ -277,7 +277,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       // wrapped in subshells (nohup, zsh -c, etc.) by different clients.
       const authKey = masterKey;
       const authFlag = authKey ? `-H "Authorization: Bearer ${authKey}"` : "";
-      const inboxUrl = `${serverUrl}/api/inbox/${id}`;
+      const inboxUrl = `${serverUrl}/api/inbox/${id}?mark_read=false`;
       const cmd = [
         `while true; do`,
         `  MSGS=$(curl ${authFlag} -sf "${inboxUrl}" 2>/dev/null)`,
@@ -487,11 +487,13 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
   // ── REST API (for CLI watch/check commands) ──
 
-  // GET /api/inbox/:sessionId - returns unread messages and marks them read
+  // GET /api/inbox/:sessionId - returns unread messages (marks read by default, ?mark_read=false to peek)
   app.get("/api/inbox/:sessionId", (req, res) => {
     const { sessionId } = req.params;
     const messages = store.getUnreadMessages(sessionId);
-    store.markRead(sessionId);
+    if (req.query.mark_read !== "false") {
+      store.markRead(sessionId);
+    }
     res.json(messages);
   });
 
