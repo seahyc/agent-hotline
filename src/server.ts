@@ -9,6 +9,7 @@ import { log } from "./log.js";
 import { getClientPid, getClientPidWithRetry } from "./pid.js";
 import { resolveSessionId } from "./identity.js";
 import { resolveContext, isPidAlive } from "./context.js";
+import { hostname } from "node:os";
 
 /** Deliver an event notification to all subscribers (as inbox messages). */
 function notifySubscribers(store: Store, event: EventType, subjectAgent: string, text: string): void {
@@ -122,9 +123,11 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       ensureRegistered();
       let agents = args.all ? store.getAgents() : store.getOnlineAgents();
 
-      // Auto-prune: mark agents with dead PIDs as offline
+      // Auto-prune: mark agents with dead PIDs as offline (local agents only)
+      const localHost = hostname();
       agents = agents.filter((a) => {
-        if (a.online && a.pid && !isPidAlive(a.pid)) {
+        const isLocal = !a.machine || a.machine === localHost;
+        if (a.online && a.pid && isLocal && !isPidAlive(a.pid)) {
           log("info", `auto-prune: PID ${a.pid} (${a.session_id}) is dead, marking offline`);
           store.markOffline(a.session_id);
           notifySubscribers(store, "agent_offline", a.session_id, `${a.session_id} went offline (process exited)`);
@@ -137,9 +140,10 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         return true;
       });
 
-      // Resolve live context once per agent, then filter
+      // Resolve live context for local agents only; remote agents use DB-stored context
       const enriched = agents.map((a) => {
-        const live = a.pid && a.online ? resolveContext(a.pid, a.session_id) : null;
+        const isLocal = !a.machine || a.machine === localHost;
+        const live = a.pid && a.online && isLocal ? resolveContext(a.pid, a.session_id) : null;
         return { agent: a, live };
       });
 

@@ -5,10 +5,14 @@ import { createStore } from "./store.js";
 import { createServer } from "./server.js";
 import { startPresenceLoop } from "./presence.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { exec, spawn } from "node:child_process";
 import { basename } from "node:path";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 import type { Message } from "./store.js";
 
 // ── ANSI colors ──
