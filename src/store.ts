@@ -37,6 +37,7 @@ export interface Store {
   getAgents(room?: string): Agent[];
   getAgent(sessionId: string): Agent | null;
   getAgentByPid(pid: number): Agent | null;
+  getRecentOnlineAgent(): Agent | null;
   resolveAgent(nameOrId: string): Agent | null;
   renameAgent(sessionId: string, name: string): void;
   createMessage(from: string, to: string, content: string): void;
@@ -54,6 +55,8 @@ export interface Store {
   hasAnyApiKey(): boolean;
   createInviteCode(): string;
   redeemInviteCode(code: string): string | null;
+  getOrCreateInboxToken(sessionId: string, ttlMs: number): string;
+  validateInboxToken(sessionId: string, token: string): boolean;
 }
 
 const CREATE_AGENTS = `
@@ -111,6 +114,13 @@ CREATE TABLE IF NOT EXISTS invite_codes (
   used INTEGER DEFAULT 0
 )`;
 
+const CREATE_INBOX_TOKENS = `
+CREATE TABLE IF NOT EXISTS inbox_tokens (
+  token TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+)`;
+
 export function createStore(dbPath?: string): Store {
   const db = new Database(dbPath ?? "./hotline.db");
   db.pragma("journal_mode = WAL");
@@ -122,6 +132,7 @@ export function createStore(dbPath?: string): Store {
   db.exec(CREATE_SUBSCRIPTIONS);
   db.exec(CREATE_API_KEYS);
   db.exec(CREATE_INVITE_CODES);
+  db.exec(CREATE_INBOX_TOKENS);
 
   const upsertAgentStmt = db.prepare(`
     INSERT INTO agents (session_id, name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
@@ -201,11 +212,28 @@ export function createStore(dbPath?: string): Store {
   const hasAnyApiKeyStmt = db.prepare(
     "SELECT 1 FROM api_keys LIMIT 1",
   );
+  const getRecentOnlineAgentStmt = db.prepare(
+    "SELECT * FROM agents WHERE online = 1 AND pid > 0 ORDER BY last_seen DESC LIMIT 1",
+  );
+
   const insertInviteCodeStmt = db.prepare(
     "INSERT INTO invite_codes (code, created_at, used) VALUES (?, ?, 0)",
   );
   const redeemInviteCodeStmt = db.prepare(
     "UPDATE invite_codes SET used = 1 WHERE code = ? AND used = 0",
+  );
+
+  const getInboxTokenStmt = db.prepare(
+    "SELECT token FROM inbox_tokens WHERE session_id = ? AND expires_at > ?",
+  );
+  const upsertInboxTokenStmt = db.prepare(
+    "INSERT OR REPLACE INTO inbox_tokens (token, session_id, expires_at) VALUES (?, ?, ?)",
+  );
+  const deleteExpiredTokensStmt = db.prepare(
+    "DELETE FROM inbox_tokens WHERE expires_at <= ?",
+  );
+  const validateInboxTokenStmt = db.prepare(
+    "SELECT 1 FROM inbox_tokens WHERE session_id = ? AND token = ? AND expires_at > ?",
   );
 
   return {
@@ -251,6 +279,10 @@ export function createStore(dbPath?: string): Store {
     getAgentByPid(pid) {
       if (!pid) return null;
       return (getAgentByPidStmt.get(pid) as Agent) ?? null;
+    },
+
+    getRecentOnlineAgent() {
+      return (getRecentOnlineAgentStmt.get() as Agent) ?? null;
     },
 
     resolveAgent(nameOrId) {
@@ -335,6 +367,22 @@ export function createStore(dbPath?: string): Store {
       if (result.changes === 0) return null;
       const key = this.createApiKey(`invited-${code}`);
       return key;
+    },
+
+    getOrCreateInboxToken(sessionId, ttlMs) {
+      const now = Date.now();
+      // Return existing valid token if one exists
+      const existing = getInboxTokenStmt.get(sessionId, now) as { token: string } | undefined;
+      if (existing) return existing.token;
+      // Clean up expired tokens lazily, then create new one
+      deleteExpiredTokensStmt.run(now);
+      const token = randomBytes(24).toString("base64url");
+      upsertInboxTokenStmt.run(token, sessionId, now + ttlMs);
+      return token;
+    },
+
+    validateInboxToken(sessionId, token) {
+      return !!validateInboxTokenStmt.get(sessionId, token, Date.now());
     },
   };
 }

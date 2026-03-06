@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Store, EventType } from "./store.js";
 import { log } from "./log.js";
-import { getClientPidWithRetry } from "./pid.js";
+import { getClientPid, getClientPidWithRetry } from "./pid.js";
 import { resolveSessionId } from "./identity.js";
 import { resolveContext, isPidAlive } from "./context.js";
 
@@ -40,20 +40,41 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
   }
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  const getServer = (clientPid?: number | null) => {
+  const getServer = (clientPid?: number | null, remotePort?: number | null) => {
     let sessionAgent: string | null = null;
 
     /** Auto-register this agent on first tool call. */
     const ensureRegistered = (): string => {
       if (sessionAgent) return sessionAgent;
 
-      // Resolve identity: PID-based > auto-generate
+      // Resolve identity: PID-based > heartbeat fallback > auto-generate
+      let resolvedPid = clientPid;
       let resolvedId: string | undefined;
       let wasResolved = false;
-      if (clientPid) {
-        resolvedId = resolveSessionId(clientPid, store) ?? undefined;
+
+      // Lazy PID retry: if PID was null at init, try again now
+      if (!resolvedPid && remotePort) {
+        resolvedPid = getClientPid(opts?.port ?? 3456, remotePort);
+        if (resolvedPid) {
+          log("info", `lazy pid resolved: remote port ${remotePort} -> PID ${resolvedPid}`);
+        }
+      }
+
+      if (resolvedPid) {
+        resolvedId = resolveSessionId(resolvedPid, store) ?? undefined;
         if (resolvedId) wasResolved = true;
       }
+
+      // Heartbeat fallback: find a recently registered online agent
+      if (!resolvedId) {
+        const recent = store.getRecentOnlineAgent();
+        if (recent) {
+          resolvedId = recent.session_id;
+          wasResolved = true;
+          log("info", `identity resolved via heartbeat fallback: ${resolvedId} (PID ${recent.pid})`);
+        }
+      }
+
       if (!resolvedId) {
         resolvedId = randomUUID();
         log("info", `auto-register generated session_id: ${resolvedId}`);
@@ -70,12 +91,12 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       } else {
         store.upsertAgent({
           session_id: resolvedId,
-          pid: clientPid ?? 0,
+          pid: resolvedPid ?? 0,
         });
       }
 
       if (wasOffline) {
-        log("info", `auto-register ${resolvedId} (PID ${clientPid}) - came online`);
+        log("info", `auto-register ${resolvedId} (PID ${resolvedPid}) - came online`);
         notifySubscribers(store, "agent_online", resolvedId,
           `${resolvedId} is now online`);
       }
@@ -306,7 +327,8 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       // wrapped in subshells (nohup, zsh -c, etc.) by different clients.
       const authKey = masterKey;
       const authFlag = authKey ? `-H "Authorization: Bearer ${authKey}"` : "";
-      const inboxUrl = `${serverUrl}/api/inbox/${id}?mark_read=false`;
+      const inboxToken = store.getOrCreateInboxToken(id, 24 * 60 * 60 * 1000);
+      const inboxUrl = `${serverUrl}/api/inbox/${id}?mark_read=false&token=${inboxToken}`;
       const cmd = [
         `while true; do`,
         `  MSGS=$(curl ${authFlag} -sf "${inboxUrl}" 2>/dev/null)`,
@@ -437,7 +459,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
           },
         });
 
-        const { mcpServer: server, getSessionAgent } = getServer(clientPid);
+        const { mcpServer: server, getSessionAgent } = getServer(clientPid, remotePort);
 
         transport.onclose = () => {
           const sid = transport.sessionId;
@@ -517,8 +539,20 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
   // ── REST API (for CLI watch/check commands) ──
 
   // GET /api/inbox/:sessionId - returns unread messages (marks read by default, ?mark_read=false to peek)
+  // Requires either a valid API key (Bearer/query) or an inbox token (?token=xxx).
+  // API key holders (hook, CLI tools) can read any inbox. Inbox tokens scope access to one agent.
   app.get("/api/inbox/:sessionId", (req, res) => {
     const { sessionId } = req.params;
+    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    const queryKey = req.query.key as string | undefined;
+    const hasApiKey = (bearer && store.validateApiKey(bearer)) || (queryKey && store.validateApiKey(queryKey));
+    if (!hasApiKey) {
+      const token = req.query.token as string | undefined;
+      if (!token || !store.validateInboxToken(sessionId, token)) {
+        res.status(403).json({ error: "Invalid or missing inbox token" });
+        return;
+      }
+    }
     const messages = store.getUnreadMessages(sessionId);
     if (req.query.mark_read !== "false") {
       store.markRead(sessionId);
