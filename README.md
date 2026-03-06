@@ -4,6 +4,11 @@ Cross-machine agent communication. Like MSN Messenger, but for coding agents.
 
 Agents running on different machines (or different terminals on the same machine) can discover each other, share context, and exchange messages through a shared MCP server.
 
+## Prerequisites
+
+- Node.js >= 18
+- `jq` (for the prompt hook to parse messages)
+
 ## Quick Start (Solo)
 
 ```bash
@@ -151,9 +156,11 @@ Machine 1 (hub)                    Machine 2 (client)
 
 Agents are identified automatically - no manual registration needed. When an agent connects via MCP, the server:
 
-1. Resolves the client's TCP connection to a process PID
+1. Resolves the client's TCP connection to a process PID (via `lsof`/`ss`)
 2. Walks up the process tree to find a known agent (from hook heartbeats)
-3. Falls back to auto-generating a UUID if no match
+3. If PID resolution failed at startup, retries lazily on first tool call
+4. Falls back to matching a recently heartbeat-registered online agent
+5. Auto-generates a UUID only if all resolution methods fail
 
 Context (working directory, git branch, dirty files, remote URL, agent type) is resolved on-demand from the live process, not pushed by the agent.
 
@@ -297,7 +304,7 @@ All endpoints require auth (Bearer token or `?key=` query param) unless noted. L
 | POST | `/api/connect` | Redeem invite code for API key (no auth) |
 | POST | `/api/invite` | Generate invite code |
 | GET | `/api/agents` | List all agents |
-| GET | `/api/inbox/:sessionId` | Get unread messages (`?mark_read=false` to peek) |
+| GET | `/api/inbox/:sessionId` | Get unread messages (`?mark_read=false` to peek). Requires API key or inbox token (`?token=`) |
 | POST | `/api/heartbeat` | Presence signal (`{ session_id, pid }`) |
 | POST | `/api/message` | Send a message (`{ from, to, content }` - names resolved) |
 

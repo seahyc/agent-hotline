@@ -4,7 +4,7 @@
   "description": "Cross-machine agent communication - MSN Messenger for coding agents",
   "type": "module",
   "bin": {
-    "agent-hotline": "./dist/index.js"
+    "agent-hotline": "dist/index.js"
   },
   "scripts": {
     "build": "tsc && cp src/hook.sh dist/hook.sh",
@@ -12,7 +12,25 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
-  "keywords": ["mcp", "ai-agents", "claude-code", "opencode", "codex", "communication"],
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "claude-code",
+    "opencode",
+    "codex",
+    "communication"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seahyc/agent-hotline.git"
+  },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
