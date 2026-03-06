@@ -44,9 +44,20 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
   const getServer = (clientPid?: number | null, remotePort?: number | null) => {
     let sessionAgent: string | null = null;
 
-    /** Auto-register this agent on first tool call. */
+    /** Auto-register this agent on first tool call, re-resolve if PID died (session replaced). */
     const ensureRegistered = (): string => {
-      if (sessionAgent) return sessionAgent;
+      if (sessionAgent) {
+        // Re-check: if our agent's PID is dead, the session may have been replaced (e.g. context cleared)
+        const current = store.getAgent(sessionAgent);
+        if (current && current.pid && !isPidAlive(current.pid)) {
+          log("info", `session ${sessionAgent} PID ${current.pid} is dead, re-resolving identity`);
+          store.markOffline(sessionAgent);
+          sessionAgent = null;
+          // fall through to re-resolve
+        } else {
+          return sessionAgent;
+        }
+      }
 
       // Resolve identity: PID-based > heartbeat fallback > auto-generate
       let resolvedPid = clientPid;
@@ -579,6 +590,18 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     }
     const existing = store.getAgent(body.session_id);
     const wasOffline = !existing || !existing.online;
+
+    // Session handover: if this PID was claimed by a different agent, retire it
+    if (body.pid) {
+      const prev = store.getAgentByPid(body.pid);
+      if (prev && prev.session_id !== body.session_id) {
+        log("info", `session handover: PID ${body.pid} moved from ${prev.session_id} to ${body.session_id}`);
+        store.markOffline(prev.session_id);
+        notifySubscribers(store, "agent_offline", prev.session_id,
+          `${prev.session_id} went offline (session replaced by ${body.session_id})`);
+      }
+    }
+
     store.upsertAgent({
       session_id: body.session_id,
       pid: body.pid ?? 0,
