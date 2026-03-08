@@ -89,9 +89,10 @@ async function handleGossip(request: Request, env: Env): Promise<Response> {
 
   const now = Date.now();
 
-  // Merge incoming peers
+  // Merge incoming peers (skip localhost — unreachable cross-machine)
   for (const peer of payload.peers) {
     if (peer.nodeId === WORKER_NODE_ID) continue;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(peer.addr ?? "")) continue;
     await env.DB.prepare(
       `INSERT INTO peers (node_id, addr, last_seen, status, agents_json, missed_gossip)
        VALUES (?, ?, ?, 'alive', ?, 0)
@@ -104,14 +105,16 @@ async function handleGossip(request: Request, env: Env): Promise<Response> {
     ).bind(peer.nodeId, peer.addr, now, JSON.stringify(peer.agents)).run();
   }
 
-  // Build response with our view
+  // Build response with our view (exclude localhost peers — they're unreachable cross-machine)
   const dbPeers = await env.DB.prepare("SELECT * FROM peers WHERE status != 'dead'").all();
-  const responsePeers: GossipPeerInfo[] = (dbPeers.results ?? []).map((p: any) => ({
-    nodeId: p.node_id,
-    addr: p.addr,
-    lastSeen: p.last_seen,
-    agents: JSON.parse(p.agents_json || "[]"),
-  }));
+  const responsePeers: GossipPeerInfo[] = (dbPeers.results ?? [])
+    .filter((p: any) => !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(p.addr ?? ""))
+    .map((p: any) => ({
+      nodeId: p.node_id,
+      addr: p.addr,
+      lastSeen: p.last_seen,
+      agents: JSON.parse(p.agents_json || "[]"),
+    }));
 
   // Include self
   responsePeers.push({
@@ -180,13 +183,15 @@ async function handleMessage(request: Request, env: Env): Promise<Response> {
     "INSERT OR IGNORE INTO seen_message_ids (global_id, expires_at) VALUES (?, ?)",
   ).bind(msg.globalId, expires).run();
 
-  // Try to find the target node and deliver directly
+  // Try to find the target node and deliver directly (skip localhost — unreachable from Workers)
   const peers = await env.DB.prepare("SELECT * FROM peers WHERE status = 'alive'").all();
   for (const peer of peers.results ?? []) {
+    const addr: string = (peer as any).addr ?? "";
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(addr)) continue;
     const agents: { session_id: string }[] = JSON.parse((peer as any).agents_json || "[]");
     if (agents.some(a => a.session_id === msg.to)) {
       try {
-        const res = await fetch(`${(peer as any).addr}/api/message`, {
+        const res = await fetch(`${addr}/api/message`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",

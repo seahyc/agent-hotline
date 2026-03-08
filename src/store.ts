@@ -727,7 +727,7 @@ export function createStore(dbPath?: string): Store {
       for (const room of rooms) {
         createRoomStmt.run(room.name, Date.now());
         for (const member of room.members) {
-          joinRoomStmt.run(room.name, member, Date.now());
+          joinRoomStmt.run(room.name, member, Date.now(), 1);
         }
       }
     },
