@@ -1,6 +1,6 @@
 {
   "name": "agent-hotline",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Cross-machine agent communication - MSN Messenger for coding agents",
   "type": "module",
   "bin": {
