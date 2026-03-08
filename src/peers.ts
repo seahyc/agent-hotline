@@ -24,6 +24,7 @@ export interface GossipPayload {
   clusterKeyHash: string;
   peers: GossipPeerInfo[];
   rooms?: { name: string; members: string[] }[];
+  pendingMessages?: { globalId: string; from: string; to: string; content: string; originNode: string; ttl: number }[];
 }
 
 /** Hash cluster key for mDNS TXT filtering (first 8 hex chars of sha256). */
@@ -102,6 +103,23 @@ export function mergeGossip(store: Store, payload: GossipPayload, localNodeId: s
   // Merge rooms
   if (payload.rooms) {
     store.mergeRooms(payload.rooms);
+  }
+
+  // Deliver any pending messages the relay piggybacked on the gossip response
+  if (payload.pendingMessages?.length) {
+    for (const msg of payload.pendingMessages) {
+      if (store.hasSeenMessage(msg.globalId)) continue;
+      store.markMessageSeen(msg.globalId);
+      const localAgent = store.resolveAgent(msg.to);
+      if (localAgent) {
+        const agentRecord = store.getAgent(localAgent.session_id);
+        const originNode = (agentRecord as any)?.origin_node;
+        if (!originNode || originNode === "" || originNode === localNodeId) {
+          store.createMessage(msg.from, localAgent.session_id, msg.content);
+          log("info", `mesh: relay-gossip delivery ${msg.from} -> ${localAgent.session_id}`);
+        }
+      }
+    }
   }
 }
 

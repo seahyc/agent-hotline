@@ -23,6 +23,7 @@ interface GossipPayload {
   nodeId: string;
   clusterKeyHash: string;
   peers: GossipPeerInfo[];
+  pendingMessages?: MeshMessage[];
 }
 
 interface MeshMessage {
@@ -120,52 +121,42 @@ async function handleGossip(request: Request, env: Env): Promise<Response> {
     agents: [],
   });
 
-  // Check for pending messages for the gossiping node's agents
+  // Collect pending messages for the gossiping node's agents and include in response
   const incomingAgents = payload.peers
     .filter(p => p.nodeId === payload.nodeId)
     .flatMap(p => p.agents.map(a => a.session_id));
+
+  const pendingMessages: MeshMessage[] = [];
+  const toDelete: string[] = [];
 
   for (const agentId of incomingAgents) {
     const pending = await env.DB.prepare(
       "SELECT * FROM messages WHERE to_agent = ?",
     ).bind(agentId).all();
 
-    // Try to deliver pending messages to the node
-    if (pending.results?.length) {
-      const peerInfo = payload.peers.find(p => p.nodeId === payload.nodeId);
-      if (peerInfo?.addr) {
-        for (const msg of pending.results) {
-          try {
-            const res = await fetch(`${peerInfo.addr}/api/message`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${env.HOTLINE_CLUSTER_KEY}`,
-              },
-              body: JSON.stringify({
-                globalId: msg.global_id,
-                from: msg.from_agent,
-                to: msg.to_agent,
-                content: msg.content,
-                originNode: msg.origin_node,
-                ttl: (msg.ttl as number) - 1,
-              }),
-            });
-            if (res.ok) {
-              await env.DB.prepare("DELETE FROM messages WHERE global_id = ?").bind(msg.global_id).run();
-            }
-          } catch {
-            // Delivery failed, keep message for next gossip
-          }
-        }
-      }
+    for (const msg of pending.results ?? []) {
+      pendingMessages.push({
+        globalId: (msg as any).global_id,
+        from: (msg as any).from_agent,
+        to: (msg as any).to_agent,
+        content: (msg as any).content,
+        originNode: (msg as any).origin_node,
+        ttl: (msg as any).ttl - 1,
+      });
+      toDelete.push((msg as any).global_id);
     }
+  }
+
+  // Delete delivered messages from relay store
+  for (const id of toDelete) {
+    await env.DB.prepare("DELETE FROM messages WHERE global_id = ?").bind(id).run();
   }
 
   const response: GossipPayload = {
     nodeId: WORKER_NODE_ID,
     clusterKeyHash: expectedHash,
     peers: responsePeers,
+    ...(pendingMessages.length > 0 && { pendingMessages }),
   };
 
   return Response.json(response);
