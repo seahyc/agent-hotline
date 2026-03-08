@@ -49,6 +49,9 @@ export function createMeshRouter(store: Store, opts: { clusterKey: string }): Me
   function findPeerForAgent(agentId: string): { nodeId: string; addr: string } | null {
     for (const peer of store.getPeers()) {
       if (peer.status === "dead") continue;
+      // Skip localhost peers from other nodes — we can't reach their localhost
+      const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(peer.addr);
+      if (isLocalhost && peer.node_id !== localNodeId) continue;
       try {
         const agents = JSON.parse(peer.agents_json) as { session_id: string }[];
         if (agents.some((a) => a.session_id === agentId)) {
