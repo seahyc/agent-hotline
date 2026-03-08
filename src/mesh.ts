@@ -93,10 +93,12 @@ export function createMeshRouter(store: Store, opts: { clusterKey: string }): Me
         }
       }
 
-      // 3. Relay via any reachable peer (try all alive peers)
+      // 3. Relay via any reachable peer (try all alive peers, skip foreign localhost)
       const msg: MeshMessage = { globalId, from, to: resolvedTo, content, originNode: localNodeId, ttl: MAX_TTL };
       for (const p of store.getPeers()) {
         if (p.status === "dead") continue;
+        const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(p.addr);
+        if (isLocalhost && p.node_id !== localNodeId) continue;
         const relayed = await deliverToPeer(p.addr, msg);
         if (relayed) {
           store.markMessageSeen(globalId);
