@@ -37,6 +37,7 @@
     "better-sqlite3": "^11.8.1",
     "commander": "^13.1.0",
     "express": "^5.1.0",
+    "multicast-dns": "^7.2.5",
     "zod": "^3.25.3"
   },
   "devDependencies": {

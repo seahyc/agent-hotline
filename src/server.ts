@@ -10,6 +10,17 @@ import { getClientPid, getClientPidWithRetry } from "./pid.js";
 import { resolveSessionId } from "./identity.js";
 import { resolveContext, isPidAlive } from "./context.js";
 import { hostname } from "node:os";
+import { getNodeId } from "./node.js";
+import { buildGossipPayload, mergeGossip, hashClusterKey } from "./peers.js";
+import { createMeshRouter, type MeshRouter } from "./mesh.js";
+
+/** Extract @mentioned session_ids from content. */
+function extractMentions(content: string, store: Store): string[] {
+  const names = [...content.matchAll(/@([a-zA-Z0-9_-]+)/g)].map(m => m[1]);
+  return names
+    .map(n => store.resolveAgent(n)?.session_id)
+    .filter((id): id is string => !!id);
+}
 
 /** Deliver an event notification to all subscribers (as inbox messages). */
 function notifySubscribers(store: Store, event: EventType, subjectAgent: string, text: string): void {
@@ -31,7 +42,12 @@ At the START of each session:
 IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.
 You MUST always have a listener running. Every time you process a message, immediately call \`listen\` again. Never leave yourself without a listener.`;
 
-export function createServer(store: Store, opts?: { authKey?: string; port?: number }) {
+export function createServer(store: Store, opts?: {
+  authKey?: string;
+  port?: number;
+  clusterKey?: string;
+  bootstrapUrls?: string[];
+}) {
   // Auth is always enforced. Auto-generate a master key if none provided.
   const masterKey = opts?.authKey ?? store.createApiKey("master-auto");
 
@@ -40,6 +56,13 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     store.addApiKey(opts.authKey, "master");
   }
   const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  // Mesh router (only active when cluster key is set)
+  const clusterKey = opts?.clusterKey;
+  let meshRouter: MeshRouter | null = null;
+  if (clusterKey) {
+    meshRouter = createMeshRouter(store, { clusterKey });
+  }
 
   const getServer = (clientPid?: number | null, remotePort?: number | null) => {
     let sessionAgent: string | null = null;
@@ -184,6 +207,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
       }
 
       const list = filtered.map(({ agent: a, live }) => {
+        const agentRooms = store.getAgentRooms(a.session_id);
         return {
           id: a.session_id,
           name: a.name || undefined,
@@ -197,6 +221,7 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
           background_processes: live?.background_processes ?? JSON.parse(a.background_processes || "[]"),
           pid: a.pid || undefined,
           unread: store.getUnreadMessages(a.session_id).length || undefined,
+          rooms: agentRooms.length > 0 ? agentRooms : undefined,
           last_seen: a.last_seen,
           online: a.online,
         };
@@ -233,30 +258,121 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
 
     // ── Tool: message ──
     mcpServer.registerTool("message", {
-      description: "Send a message to another agent by name or ID (or '*' to broadcast to all online agents).",
+      description: "Send a message to another agent by name or ID, '#room' for room messages, or '*' to broadcast. Supports @mentions in content and reply threading.",
       inputSchema: {
-        to: z.string(),
+        to: z.string().describe("Recipient: agent name/ID, '#room' for room message, or '*' for broadcast"),
         content: z.string(),
+        reply_to: z.number().optional().describe("Message ID to reply to (from inbox)"),
       },
     }, async (args) => {
       const id = ensureRegistered();
+      const mentionedIds = extractMentions(args.content, store);
+
+      // Helper: send mention copies to agents not already receiving the message
+      const sendMentionCopies = (excludeIds: Set<string>) => {
+        for (const mid of mentionedIds) {
+          if (mid !== id && !excludeIds.has(mid)) {
+            store.createMessage(id, mid, args.content, { msgType: "mention", mentionsJson: JSON.stringify(mentionedIds) });
+          }
+        }
+      };
+
+      // Helper: send reply notification to original sender
+      const sendReplyNotify = (excludeIds: Set<string>) => {
+        if (!args.reply_to) return;
+        const original = store.getMessage(args.reply_to);
+        if (original && original.from_agent !== id && !excludeIds.has(original.from_agent)) {
+          store.createMessage(id, original.from_agent, args.content, {
+            replyToId: args.reply_to, msgType: "reply_notify",
+          });
+        }
+      };
+
+      // Room message
+      if (args.to.startsWith("#")) {
+        const roomName = args.to.slice(1);
+        // Auto-join sender to room
+        store.joinRoom(roomName, id);
+
+        // Write canonical room history entry
+        store.createRoomMessage(id, roomName, args.content, {
+          replyToId: args.reply_to, mentionsJson: JSON.stringify(mentionedIds),
+        });
+
+        const members = store.getRoomMembers(roomName);
+        const recipientSet = new Set(members);
+        let count = 0;
+        for (const member of members) {
+          if (member !== id) {
+            const level = store.resolveNotifyLevel(member, roomName);
+            const isMentioned = mentionedIds.includes(member);
+            if (level === "all" || (level === "mentions" && isMentioned)) {
+              store.createMessage(id, member, args.content, {
+                room: roomName, msgType: "room", replyToId: args.reply_to ?? undefined,
+                mentionsJson: JSON.stringify(mentionedIds),
+              });
+              count++;
+            }
+            // "mute" → skip inbox entirely (still in room history)
+          }
+        }
+        // Mention copies for agents NOT in the room
+        sendMentionCopies(recipientSet);
+        sendReplyNotify(recipientSet);
+        log("info", `mcp room message from ${id} to #${roomName} (${count} notified)`);
+        return {
+          content: [{ type: "text", text: `Message sent to #${roomName} (${count} notified)` }],
+        };
+      }
+
+      // Broadcast
       if (args.to === "*") {
         const agents = store.getOnlineAgents();
+        const recipientSet = new Set<string>();
         let count = 0;
         for (const a of agents) {
           if (a.session_id !== id) {
-            store.createMessage(id, a.session_id, args.content);
+            recipientSet.add(a.session_id);
+            if (meshRouter) {
+              await meshRouter.route(id, a.session_id, args.content);
+            } else {
+              store.createMessage(id, a.session_id, args.content, {
+                replyToId: args.reply_to ?? undefined,
+                mentionsJson: JSON.stringify(mentionedIds),
+              });
+            }
             count++;
           }
         }
+        sendMentionCopies(recipientSet);
+        sendReplyNotify(recipientSet);
         log("info", `mcp broadcast from ${id} to ${count} agents`);
         return {
           content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
         };
       }
+
+      // Direct message
+      if (meshRouter) {
+        const result = await meshRouter.route(id, args.to, args.content);
+        log("info", `mcp message ${id} -> ${result.target} (${result.method})`);
+        const recipientSet = new Set([result.target]);
+        sendMentionCopies(recipientSet);
+        sendReplyNotify(recipientSet);
+        const label = result.delivered
+          ? `Message sent to ${result.target}`
+          : `Message queued for ${result.target} (will deliver when online)`;
+        return { content: [{ type: "text", text: label }] };
+      }
       const resolved = store.resolveAgent(args.to);
       const target = resolved?.session_id ?? args.to;
-      store.createMessage(id, target, args.content);
+      store.createMessage(id, target, args.content, {
+        replyToId: args.reply_to ?? undefined,
+        mentionsJson: JSON.stringify(mentionedIds),
+      });
+      const recipientSet = new Set([target]);
+      sendMentionCopies(recipientSet);
+      sendReplyNotify(recipientSet);
       log("info", `mcp message ${id} -> ${target}`);
       return {
         content: [{ type: "text", text: `Message sent to ${resolved?.name || target}` }],
@@ -299,12 +415,16 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
         store.markRead(id);
       }
 
-      const trimmed = messages.map((m) => ({
+      const trimmed = messages.map((m: any) => ({
+        id: m.id,
         from: m.from_agent,
         from_name: store.getAgent(m.from_agent)?.name || undefined,
         content: m.content,
         time: new Date(m.timestamp).toISOString(),
         ...(args.status !== "unread" ? { read: !!m.read } : {}),
+        ...(m.room ? { room: m.room } : {}),
+        ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
+        ...(m.msg_type && m.msg_type !== "direct" ? { type: m.msg_type } : {}),
       }));
       return {
         content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
@@ -368,6 +488,150 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
           `When this exits with a message, process it then IMMEDIATELY call \`listen\` again. You must ALWAYS have a listener running.`,
         ].join("\n") }],
       };
+    });
+
+    // ── Tool: join ──
+    mcpServer.registerTool("join", {
+      description: "Join a room (creates it if it doesn't exist). Room names can be given as '#general' or 'general'.",
+      inputSchema: {
+        room: z.string().describe("Room name, e.g. '#general' or 'general'"),
+      },
+    }, async (args) => {
+      const id = ensureRegistered();
+      const roomName = args.room.replace(/^#/, "");
+      store.joinRoom(roomName, id);
+      const members = store.getRoomMembers(roomName);
+      return {
+        content: [{ type: "text", text: `Joined #${roomName} (${members.length} member(s))` }],
+      };
+    });
+
+    // ── Tool: leave ──
+    mcpServer.registerTool("leave", {
+      description: "Leave a room.",
+      inputSchema: {
+        room: z.string().describe("Room name, e.g. '#general' or 'general'"),
+      },
+    }, async (args) => {
+      const id = ensureRegistered();
+      const roomName = args.room.replace(/^#/, "");
+      store.leaveRoom(roomName, id);
+      return {
+        content: [{ type: "text", text: `Left #${roomName}` }],
+      };
+    });
+
+    // ── Tool: rooms ──
+    mcpServer.registerTool("rooms", {
+      description: "List rooms. By default shows only your rooms; set `all: true` to see all rooms.",
+      inputSchema: {
+        all: z.boolean().optional().default(false).describe("Show all rooms (not just joined)"),
+      },
+    }, async (args) => {
+      const id = ensureRegistered();
+      const myRooms = new Set(store.getAgentRooms(id));
+      const allRooms = store.listRooms();
+      const filtered = args.all ? allRooms : allRooms.filter((r) => myRooms.has(r.name));
+      const result = filtered.map((r) => {
+        const members = store.getRoomMembers(r.name);
+        return {
+          name: r.name,
+          memberCount: r.memberCount,
+          members: members.map((sid) => {
+            const agent = store.getAgent(sid);
+            return { id: sid, name: agent?.name || undefined };
+          }),
+          joined: myRooms.has(r.name),
+          notify: myRooms.has(r.name) ? store.resolveNotifyLevel(id, r.name) : undefined,
+        };
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    });
+
+    // ── Tool: read ──
+    mcpServer.registerTool("read", {
+      description: "Browse room history or DM thread history. Use `room` for room messages or `dm` for direct message history with another agent.",
+      inputSchema: {
+        room: z.string().optional().describe("Room name (e.g. '#general' or 'general') — browse room history"),
+        dm: z.string().optional().describe("Agent name or ID — browse DM thread history"),
+        limit: z.number().optional().default(50).describe("Max messages to return (newest first)"),
+        before: z.string().optional().describe("ISO timestamp cursor — fetch messages older than this"),
+      },
+    }, async (args) => {
+      const id = ensureRegistered();
+
+      if (!args.room && !args.dm) {
+        return { content: [{ type: "text", text: "Specify either `room` or `dm` to read history." }] };
+      }
+
+      const beforeTs = args.before ? new Date(args.before).getTime() : undefined;
+
+      if (args.room) {
+        const roomName = args.room.replace(/^#/, "");
+        const msgs = store.getRoomMessages(roomName, args.limit, beforeTs);
+        const result = msgs.map((m) => ({
+          id: m.id,
+          from: m.from_agent,
+          from_name: store.getAgent(m.from_agent)?.name || undefined,
+          content: m.content,
+          time: new Date(m.timestamp).toISOString(),
+          ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
+        }));
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      // DM history: find messages between caller and target
+      if (args.dm) {
+        const resolved = store.resolveAgent(args.dm);
+        const targetId = resolved?.session_id ?? args.dm;
+        // Get messages where caller is sender or recipient with the target
+        const myMessages = store.getMessages(id, args.limit * 2, beforeTs);
+        const theirMessages = store.getMessages(targetId, args.limit * 2, beforeTs);
+        const allMsgs = [...myMessages, ...theirMessages]
+          .filter((m) =>
+            (m.from_agent === id && m.to_agent === targetId) ||
+            (m.from_agent === targetId && m.to_agent === id)
+          )
+          .filter((m) => !m.room) // exclude room messages
+          .sort((a, b) => b.timestamp - a.timestamp)
+          .slice(0, args.limit);
+        // Deduplicate by id
+        const seen = new Set<number>();
+        const deduped = allMsgs.filter((m) => {
+          if (seen.has(m.id)) return false;
+          seen.add(m.id);
+          return true;
+        });
+        const result = deduped.map((m) => ({
+          id: m.id,
+          from: m.from_agent,
+          from_name: store.getAgent(m.from_agent)?.name || undefined,
+          content: m.content,
+          time: new Date(m.timestamp).toISOString(),
+          ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
+          ...(m.msg_type && m.msg_type !== "direct" ? { type: m.msg_type } : {}),
+        }));
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      return { content: [{ type: "text", text: "[]" }] };
+    });
+
+    // ── Tool: notify ──
+    mcpServer.registerTool("notify", {
+      description: "Set notification preferences for a room or globally. Levels: 'all' (every message), 'mentions' (only @mentions), 'mute' (no inbox copies). Omit `room` to set global default.",
+      inputSchema: {
+        room: z.string().optional().describe("Room name (e.g. '#general' or 'general'). Omit for global default."),
+        level: z.enum(["all", "mentions", "mute"]).describe("Notification level"),
+      },
+    }, async (args) => {
+      const id = ensureRegistered();
+      const roomName = args.room ? args.room.replace(/^#/, "") : null;
+      store.setNotifyPref(id, roomName, args.level);
+      const label = roomName ? `#${roomName} notifications` : "Global default";
+      return { content: [{ type: "text", text: `${label}: ${args.level}` }] };
     });
 
     // ── Resource: hotline://agents ──
@@ -650,32 +914,97 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     res.json({ ok: true });
   });
 
-  // POST /api/message - send a message via REST
-  app.post("/api/message", (req, res) => {
-    const { from, to, content } = req.body;
+  // POST /api/message - send a message via REST (also handles mesh relay)
+  app.post("/api/message", async (req, res) => {
+    const body = req.body;
+
+    // Mesh relay message (from another node)
+    if (body.globalId && body.originNode && meshRouter) {
+      // Validate cluster key for inter-node messages
+      const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      if (clusterKey && bearer !== clusterKey) {
+        res.status(401).json({ error: "Invalid cluster key" });
+        return;
+      }
+      const accepted = await meshRouter.receiveRelayed(body);
+      res.json({ ok: true, accepted });
+      return;
+    }
+
+    // Regular REST message (local origin)
+    const { from, to, content } = body;
     if (!from || !to || !content) {
       res.status(400).json({ error: "from, to, and content are required" });
       return;
     }
-    // Resolve names for both from and to
     const resolvedFrom = store.resolveAgent(from)?.session_id ?? from;
     if (to === "*") {
       const agents = store.getOnlineAgents();
       let count = 0;
       for (const a of agents) {
         if (a.session_id !== resolvedFrom) {
-          store.createMessage(resolvedFrom, a.session_id, content);
+          if (meshRouter) {
+            await meshRouter.route(resolvedFrom, a.session_id, content);
+          } else {
+            store.createMessage(resolvedFrom, a.session_id, content);
+          }
           count++;
         }
       }
       log("info", `message broadcast from ${resolvedFrom} to ${count} agents`);
       res.json({ ok: true, broadcast: count });
     } else {
-      const resolvedTo = store.resolveAgent(to)?.session_id ?? to;
-      store.createMessage(resolvedFrom, resolvedTo, content);
-      log("info", `message ${resolvedFrom} -> ${resolvedTo}`);
-      res.json({ ok: true, to: resolvedTo });
+      if (meshRouter) {
+        const result = await meshRouter.route(resolvedFrom, to, content);
+        log("info", `message ${resolvedFrom} -> ${result.target} (${result.method})`);
+        res.json({ ok: true, to: result.target, method: result.method });
+      } else {
+        const resolvedTo = store.resolveAgent(to)?.session_id ?? to;
+        store.createMessage(resolvedFrom, resolvedTo, content);
+        log("info", `message ${resolvedFrom} -> ${resolvedTo}`);
+        res.json({ ok: true, to: resolvedTo });
+      }
     }
+  });
+
+  // POST /api/gossip - mesh gossip endpoint
+  app.post("/api/gossip", (req, res) => {
+    // Validate cluster key
+    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    if (clusterKey && bearer !== clusterKey) {
+      res.status(401).json({ error: "Invalid cluster key" });
+      return;
+    }
+    if (!clusterKey) {
+      res.status(400).json({ error: "Mesh not configured (no cluster key)" });
+      return;
+    }
+
+    const payload = req.body;
+    if (!payload?.nodeId || !payload?.peers) {
+      res.status(400).json({ error: "Invalid gossip payload" });
+      return;
+    }
+
+    // Validate cluster key hash
+    const expectedHash = hashClusterKey(clusterKey);
+    if (payload.clusterKeyHash && payload.clusterKeyHash !== expectedHash) {
+      res.status(401).json({ error: "Cluster key mismatch" });
+      return;
+    }
+
+    const localNodeId = getNodeId();
+    mergeGossip(store, payload, localNodeId);
+
+    // Also retry pending messages when we learn about new peers
+    if (meshRouter) {
+      meshRouter.retryPending().catch((e) => log("error", `retry pending failed: ${e}`));
+    }
+
+    // Respond with our view
+    const selfAddr = `http://localhost:${opts?.port ?? 3456}`;
+    const response = buildGossipPayload(store, clusterKey, selfAddr);
+    res.json(response);
   });
 
   // Catch-all: return JSON 404 (prevents Express HTML 404 from confusing MCP OAuth discovery)
@@ -683,5 +1012,5 @@ export function createServer(store: Store, opts?: { authKey?: string; port?: num
     res.status(404).json({ error: "Not found" });
   });
 
-  return { app, getServer, transports, masterKey };
+  return { app, getServer, transports, masterKey, meshRouter };
 }

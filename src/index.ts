@@ -9,7 +9,6 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { exec, spawn } from "node:child_process";
-import { basename } from "node:path";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -95,10 +94,11 @@ program
 // ── serve ──
 program
   .command("serve")
-  .description("Start the MCP server (hub mode by default, or client mode with --hub)")
+  .description("Start the MCP server (mesh peer node)")
   .option("--port <port>", "Port to listen on", "3456")
   .option("--auth-key <key>", "Authentication key")
-  .option("--hub <url>", "Hub server URL (enables client/proxy mode)")
+  .option("--bootstrap <urls>", "Comma-separated bootstrap peer URLs (e.g. https://hotline.example.com)")
+  .option("--cluster-key <key>", "Cluster key for mesh authentication (also reads HOTLINE_CLUSTER_KEY env)")
   .option("--db <path>", "Database file path")
   .option("--retention-days <days>", "Auto-delete messages older than N days (0 = keep forever)", "7")
   .action(async (opts) => {
@@ -106,107 +106,79 @@ program
     initLog();
 
     const port = parseInt(opts.port, 10);
-    const hubUrl = opts.hub?.replace(/\/+$/, "");
+    const dbPath = opts.db ?? defaultDbPath();
+    const retentionDays = parseInt(opts.retentionDays, 10);
+    const clusterKey = opts.clusterKey || process.env.HOTLINE_CLUSTER_KEY || readConfig().HOTLINE_CLUSTER_KEY || undefined;
+    const bootstrapUrls = opts.bootstrap
+      ? (opts.bootstrap as string).split(",").map((u: string) => u.trim().replace(/\/+$/, ""))
+      : [];
 
-    if (hubUrl) {
-      // ── Client mode: stateless proxy to hub ──
-      const authKey = opts.authKey ?? readConfig().HOTLINE_AUTH_KEY;
-      if (!authKey) {
-        console.error("Auth key required in client mode. Use --auth-key or run 'agent-hotline connect' first.");
-        process.exit(1);
-      }
+    const store = createStore(dbPath);
+    const authKey = opts.authKey ?? readConfig().HOTLINE_AUTH_KEY ?? undefined;
+    const { app, masterKey } = createServer(store, { authKey, port, clusterKey, bootstrapUrls });
+    const presence = startPresenceLoop(store, undefined, retentionDays > 0 ? retentionDays : undefined);
 
-      const { createClientServer } = await import("./client.js");
-      const { app: clientApp, stop } = createClientServer({ hubUrl, authKey, port });
-
-      // Save config pointing to localhost
-      const cfgDir = configDir();
-      if (!existsSync(cfgDir)) mkdirSync(cfgDir, { recursive: true });
-      const cfgPath = join(cfgDir, "config");
-      const existingConfig = existsSync(cfgPath) ? readFileSync(cfgPath, "utf-8") : "";
-      const configLines = existingConfig.split("\n").filter((l) =>
-        !l.startsWith("HOTLINE_AUTH_KEY=") &&
-        !l.startsWith("HOTLINE_SERVER=") &&
-        !l.startsWith("HOTLINE_HUB=")
-      );
-      configLines.unshift(`HOTLINE_HUB=${hubUrl}`);
-      configLines.unshift(`HOTLINE_SERVER=http://localhost:${port}`);
-      configLines.unshift(`HOTLINE_AUTH_KEY=${authKey}`);
-      writeFileSync(cfgPath, configLines.filter(Boolean).join("\n") + "\n", "utf-8");
-
-      const server = clientApp.listen(port, () => {
-        log("info", `client server started on port ${port}, hub=${hubUrl}`);
-        console.log();
-        console.log(`${BOLD}${MAGENTA}  Agent Hotline ${YELLOW}(client mode)${RESET}`);
-        console.log(`${DIM}  ────────────────────────────${RESET}`);
-        console.log(`  ${GREEN}Local proxy${RESET}   http://localhost:${port}`);
-        console.log(`  ${GREEN}Hub${RESET}           ${hubUrl}`);
-        console.log(`  ${GREEN}Health${RESET}        http://localhost:${port}/health`);
-        console.log();
-        console.log(`  ${CYAN}All traffic proxied to hub. PID monitoring active locally.${RESET}`);
-        console.log(`  ${DIM}Press Ctrl+C to stop${RESET}`);
-        console.log();
-      });
-
-      const shutdown = () => {
-        console.log(`\n${DIM}Shutting down client...${RESET}`);
-        stop();
-        server.close();
-        process.exit(0);
-      };
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
-    } else {
-      // ── Hub mode (default, unchanged) ──
-      const dbPath = opts.db ?? defaultDbPath();
-      const retentionDays = parseInt(opts.retentionDays, 10);
-
-      const store = createStore(dbPath);
-      const authKey = opts.authKey ?? readConfig().HOTLINE_AUTH_KEY ?? undefined;
-      const { app, masterKey } = createServer(store, { authKey, port });
-      const presence = startPresenceLoop(store, undefined, retentionDays > 0 ? retentionDays : undefined);
-
-      // Save auth key to local config so hook.sh picks it up
-      const cfgDir = configDir();
-      if (!existsSync(cfgDir)) mkdirSync(cfgDir, { recursive: true });
-      const cfgPath = join(cfgDir, "config");
-      const existingConfig = existsSync(cfgPath) ? readFileSync(cfgPath, "utf-8") : "";
-      const configLines = existingConfig.split("\n").filter((l) => !l.startsWith("HOTLINE_AUTH_KEY=") && !l.startsWith("HOTLINE_SERVER="));
-      configLines.unshift(`HOTLINE_SERVER=http://localhost:${port}`);
-      configLines.unshift(`HOTLINE_AUTH_KEY=${masterKey}`);
-      writeFileSync(cfgPath, configLines.filter(Boolean).join("\n") + "\n", "utf-8");
-
-      const server = app.listen(port, () => {
-        log("info", `hub server started on port ${port}, db=${dbPath}`);
-        console.log();
-        console.log(`${BOLD}${MAGENTA}  Agent Hotline${RESET}`);
-        console.log(`${DIM}  ────────────────────────────${RESET}`);
-        console.log(`  ${GREEN}MCP endpoint${RESET}  http://localhost:${port}/mcp`);
-        console.log(`  ${GREEN}REST API${RESET}      http://localhost:${port}/api/`);
-        console.log(`  ${GREEN}Health${RESET}        http://localhost:${port}/health`);
-        console.log(`  ${DIM}Database${RESET}      ${dbPath}`);
-        console.log(`  ${DIM}Retention${RESET}     ${retentionDays > 0 ? `${retentionDays} days` : "forever"}`);
-        console.log(`  ${GREEN}Auth key${RESET}     ${masterKey}${opts.authKey ? "" : " (auto-generated)"}`);
-        console.log();
-        const mcpUrl = `http://localhost:${port}/mcp`;
-        console.log(`  ${CYAN}Add to Claude Code:${RESET}`);
-        console.log(`  claude mcp add-json hotline '${JSON.stringify({ type: "url", url: mcpUrl })}'`);
-        console.log();
-        console.log(`  ${DIM}Press Ctrl+C to stop${RESET}`);
-        console.log();
-      });
-
-      const shutdown = () => {
-        console.log(`\n${DIM}Shutting down...${RESET}`);
-        presence.stop();
-        server.close();
-        store.close();
-        process.exit(0);
-      };
-
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
+    // Start gossip loop if cluster key is configured
+    let gossipHandle: { stop: () => void } | null = null;
+    let mdnsHandle: { stop: () => void } | null = null;
+    if (clusterKey) {
+      const { startGossipLoop, startMdns } = await import("./peers.js");
+      const selfAddr = `http://localhost:${port}`;
+      gossipHandle = startGossipLoop(store, { clusterKey, bootstrapUrls, selfAddr });
+      mdnsHandle = startMdns(store, { clusterKey, port });
+      log("info", `mesh enabled: cluster key set, ${bootstrapUrls.length} bootstrap peers`);
     }
+
+    // Save auth key to local config so hook.sh picks it up
+    const cfgDir = configDir();
+    if (!existsSync(cfgDir)) mkdirSync(cfgDir, { recursive: true });
+    const cfgPath = join(cfgDir, "config");
+    const existingConfig = existsSync(cfgPath) ? readFileSync(cfgPath, "utf-8") : "";
+    const configLines = existingConfig.split("\n").filter((l) =>
+      !l.startsWith("HOTLINE_AUTH_KEY=") &&
+      !l.startsWith("HOTLINE_SERVER=") &&
+      !l.startsWith("HOTLINE_CLUSTER_KEY=")
+    );
+    configLines.unshift(`HOTLINE_SERVER=http://localhost:${port}`);
+    configLines.unshift(`HOTLINE_AUTH_KEY=${masterKey}`);
+    if (clusterKey) configLines.unshift(`HOTLINE_CLUSTER_KEY=${clusterKey}`);
+    writeFileSync(cfgPath, configLines.filter(Boolean).join("\n") + "\n", "utf-8");
+
+    const server = app.listen(port, () => {
+      log("info", `server started on port ${port}, db=${dbPath}`);
+      console.log();
+      console.log(`${BOLD}${MAGENTA}  Agent Hotline${RESET}`);
+      console.log(`${DIM}  ────────────────────────────${RESET}`);
+      console.log(`  ${GREEN}MCP endpoint${RESET}  http://localhost:${port}/mcp`);
+      console.log(`  ${GREEN}REST API${RESET}      http://localhost:${port}/api/`);
+      console.log(`  ${GREEN}Health${RESET}        http://localhost:${port}/health`);
+      console.log(`  ${DIM}Database${RESET}      ${dbPath}`);
+      console.log(`  ${DIM}Retention${RESET}     ${retentionDays > 0 ? `${retentionDays} days` : "forever"}`);
+      console.log(`  ${GREEN}Auth key${RESET}     ${masterKey}${opts.authKey ? "" : " (auto-generated)"}`);
+      if (clusterKey) {
+        console.log(`  ${GREEN}Mesh${RESET}         enabled (${bootstrapUrls.length} bootstrap peers)`);
+      }
+      console.log();
+      const mcpUrl = `http://localhost:${port}/mcp`;
+      console.log(`  ${CYAN}Add to Claude Code:${RESET}`);
+      console.log(`  claude mcp add-json hotline '${JSON.stringify({ type: "url", url: mcpUrl })}'`);
+      console.log();
+      console.log(`  ${DIM}Press Ctrl+C to stop${RESET}`);
+      console.log();
+    });
+
+    const shutdown = () => {
+      console.log(`\n${DIM}Shutting down...${RESET}`);
+      if (gossipHandle) gossipHandle.stop();
+      if (mdnsHandle) mdnsHandle.stop();
+      presence.stop();
+      server.close();
+      store.close();
+      process.exit(0);
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   });
 
 // ── watch ──
@@ -380,79 +352,93 @@ program
 // ── connect ──
 program
   .command("connect")
-  .description("Connect to a hotline server using an invite code")
-  .argument("<url>", "Server URL (e.g. https://abc123.ngrok.io)")
-  .requiredOption("--code <code>", "Invite code")
+  .description("Connect to a mesh using an invite code or cluster key")
+  .argument("<url>", "Bootstrap peer URL (e.g. https://hotline.example.com)")
+  .option("--code <code>", "Invite code (legacy)")
+  .option("--cluster-key <key>", "Cluster key for mesh authentication")
   .action(async (url, opts) => {
-    const serverUrl = url.replace(/\/+$/, "");
-    try {
-      const res = await fetch(`${serverUrl}/api/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: opts.code }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        console.error(`Failed: ${res.status} ${(body as Record<string, string>).error || ""}`);
+    const bootstrapUrl = url.replace(/\/+$/, "");
+    const clusterKey = opts.clusterKey || process.env.HOTLINE_CLUSTER_KEY;
+
+    if (opts.code) {
+      // Legacy invite code flow
+      try {
+        const res = await fetch(`${bootstrapUrl}/api/connect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: opts.code }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          console.error(`Failed: ${res.status} ${(body as Record<string, string>).error || ""}`);
+          process.exit(1);
+        }
+        const { key } = (await res.json()) as { key: string };
+        // Save config
+        const dir = configDir();
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        const cfgPath = join(dir, "config");
+        writeFileSync(cfgPath, [
+          `HOTLINE_AUTH_KEY=${key}`,
+          `HOTLINE_SERVER=http://localhost:3456`,
+        ].join("\n") + "\n", "utf-8");
+        console.log(`${BOLD}${GREEN}Connected via invite code!${RESET}`);
+        console.log(`${DIM}Config saved to ${cfgPath}${RESET}`);
+      } catch (e) {
+        console.error("Could not connect to server.", e);
         process.exit(1);
       }
-      const { key } = (await res.json()) as { key: string };
+      return;
+    }
 
-      // Save config + install hook.sh
-      const dir = configDir();
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      const cfgPath = join(dir, "config");
-      const localPort = 3456;
-      writeFileSync(cfgPath, [
-        `HOTLINE_AUTH_KEY=${key}`,
-        `HOTLINE_SERVER=http://localhost:${localPort}`,
-        `HOTLINE_HUB=${serverUrl}`,
-      ].join("\n") + "\n", "utf-8");
-
-      // Copy hook.sh
-      const { copyHookScript } = await import("./setup/hook.js");
-      copyHookScript();
-
-      // Auto-start local client server as a background daemon
-      const scriptPath = join(__dirname, "index.js");
-      const logPath = join(dir, "client.log");
-      const child = spawn("node", [scriptPath, "serve", "--port", String(localPort), "--hub", serverUrl, "--auth-key", key], {
-        detached: true,
-        stdio: ["ignore", "ignore", "ignore"],
-      });
-      child.unref();
-
-      const localMcpUrl = `http://localhost:${localPort}/mcp`;
-
-      console.log();
-      console.log(`${BOLD}${GREEN}Connected!${RESET}`);
-      console.log(`${DIM}Config saved to ${cfgPath}${RESET}`);
-      console.log(`${GREEN}Local client server started${RESET} on port ${localPort} (PID ${child.pid})`);
-      console.log();
-      console.log(`${BOLD}Next steps${RESET} - add the MCP server and hook to your tool:`);
-      console.log();
-      console.log(`  ${CYAN}Claude Code (recommended):${RESET}`);
-      console.log(`    agent-hotline setup claude-code`);
-      console.log();
-      console.log(`  ${CYAN}Claude Code (manual):${RESET}`);
-      console.log(`    claude mcp add-json hotline '${JSON.stringify({ type: "url", url: localMcpUrl })}'`);
-      console.log(`    ${DIM}Then add to ~/.claude/settings.json hooks.UserPromptSubmit:${RESET}`);
-      console.log(`    ${DIM}{"matcher": "", "hooks": [{"type": "command", "command": "bash ~/.agent-hotline/hook.sh"}]}${RESET}`);
-      console.log();
-      console.log(`  ${CYAN}Codex:${RESET}`);
-      console.log(`    Add to ~/.codex/config.toml:`);
-      console.log(`    ${DIM}[mcp_servers.hotline]${RESET}`);
-      console.log(`    ${DIM}type = "url"${RESET}`);
-      console.log(`    ${DIM}url = "${localMcpUrl}"${RESET}`);
-      console.log();
-      console.log(`  ${CYAN}OpenCode:${RESET}`);
-      console.log(`    Add to opencode.json:`);
-      console.log(`    ${DIM}"mcp": { "hotline": { "type": "remote", "url": "${localMcpUrl}" } }${RESET}`);
-      console.log();
-    } catch (e) {
-      console.error("Could not connect to server.", e);
+    if (!clusterKey) {
+      console.error("Either --cluster-key or --code is required.");
       process.exit(1);
     }
+
+    // Save config + install hook.sh
+    const dir = configDir();
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const cfgPath = join(dir, "config");
+    const localPort = 3456;
+    writeFileSync(cfgPath, [
+      `HOTLINE_CLUSTER_KEY=${clusterKey}`,
+      `HOTLINE_SERVER=http://localhost:${localPort}`,
+    ].join("\n") + "\n", "utf-8");
+
+    // Copy hook.sh
+    const { copyHookScript } = await import("./setup/hook.js");
+    copyHookScript();
+
+    // Auto-start local server as a background daemon with mesh enabled
+    const scriptPath = join(__dirname, "index.js");
+    const child = spawn("node", [
+      scriptPath, "serve",
+      "--port", String(localPort),
+      "--bootstrap", bootstrapUrl,
+      "--cluster-key", clusterKey,
+    ], {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    child.unref();
+
+    const localMcpUrl = `http://localhost:${localPort}/mcp`;
+
+    console.log();
+    console.log(`${BOLD}${GREEN}Connected to mesh!${RESET}`);
+    console.log(`${DIM}Config saved to ${cfgPath}${RESET}`);
+    console.log(`${GREEN}Local server started${RESET} on port ${localPort} (PID ${child.pid})`);
+    console.log(`${DIM}Bootstrap peer: ${bootstrapUrl}${RESET}`);
+    console.log();
+    console.log(`${BOLD}Next steps${RESET} - add the MCP server and hook to your tool:`);
+    console.log();
+    console.log(`  ${CYAN}Claude Code (recommended):${RESET}`);
+    console.log(`    agent-hotline setup claude-code`);
+    console.log();
+    console.log(`  ${CYAN}Claude Code (manual):${RESET}`);
+    console.log(`    claude mcp add-json hotline '${JSON.stringify({ type: "url", url: localMcpUrl })}'`);
+    console.log();
   });
 
 program.parse();

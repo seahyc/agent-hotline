@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createServer } from "./server.js";
 import { createStore, type Store } from "./store.js";
-import type { Agent, Message } from "./store.js";
+import type { Agent, Message, RoomMessage } from "./store.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { unlinkSync } from "node:fs";
@@ -24,7 +24,11 @@ function cleanDb() {
 function mockStore(): Store {
   const agents: Agent[] = [];
   const messages: Message[] = [];
+  const roomsMap = new Map<string, Set<string>>(); // room_name -> set of session_ids
+  const roomMessages: RoomMessage[] = [];
+  const notifyPrefs = new Map<string, string>(); // "sessionId:roomName" or "sessionId:" for global
   let msgId = 0;
+  let roomMsgId = 0;
 
   return {
     close: vi.fn(),
@@ -32,6 +36,7 @@ function mockStore(): Store {
       const idx = agents.findIndex((a) => a.session_id === agent.session_id);
       const full: Agent = {
         session_id: agent.session_id,
+        name: agent.name ?? "",
         agent_type: agent.agent_type ?? "",
         machine: agent.machine ?? "",
         cwd: agent.cwd ?? "",
@@ -54,6 +59,7 @@ function mockStore(): Store {
           ...existing,
           ...full,
           // Preserve existing non-empty values if new value is empty
+          name: full.name || existing.name,
           agent_type: full.agent_type || existing.agent_type,
           machine: full.machine || existing.machine,
           cwd: full.cwd || existing.cwd,
@@ -73,9 +79,25 @@ function mockStore(): Store {
     }),
     getAgent: vi.fn((name: string) => agents.find((a) => a.session_id === name) ?? null),
     getAgentByPid: vi.fn((pid: number) => agents.find((a) => a.pid === pid && a.online === 1) ?? null),
-    createMessage: vi.fn((from: string, to: string, content: string) => {
-      messages.push({ id: ++msgId, from_agent: from, to_agent: to, content, timestamp: Date.now(), read: 0 });
+    getRecentOnlineAgent: vi.fn(() => agents.find((a) => a.online === 1 && a.pid > 0) ?? null),
+    resolveAgent: vi.fn((nameOrId: string) => {
+      return agents.find((a) => a.name === nameOrId) ?? agents.find((a) => a.session_id === nameOrId) ?? null;
     }),
+    renameAgent: vi.fn((sessionId: string, name: string) => {
+      const agent = agents.find((a) => a.session_id === sessionId);
+      if (agent) agent.name = name;
+    }),
+    createMessage: vi.fn((from: string, to: string, content: string, extra?: any) => {
+      const id = ++msgId;
+      messages.push({
+        id, global_id: "", from_agent: from, to_agent: to, content, timestamp: Date.now(), read: 0,
+        delivery_status: "delivered",
+        room: extra?.room ?? null, reply_to_id: extra?.replyToId ?? null,
+        mentions_json: extra?.mentionsJson ?? "[]", msg_type: extra?.msgType ?? "direct",
+      });
+      return id;
+    }),
+    getMessage: vi.fn((id: number) => messages.find((m) => m.id === id) ?? null),
     getUnreadMessages: vi.fn((agentName: string) =>
       messages.filter((m) => m.to_agent === agentName && m.read === 0),
     ),
@@ -98,6 +120,84 @@ function mockStore(): Store {
     hasAnyApiKey: vi.fn(() => true),
     createInviteCode: vi.fn(() => "abc123"),
     redeemInviteCode: vi.fn(() => "redeemed-key"),
+    getOrCreateInboxToken: vi.fn(() => "test-inbox-token"),
+    validateInboxToken: vi.fn(() => true),
+    // Mesh networking methods
+    upsertPeer: vi.fn(),
+    getPeers: vi.fn(() => []),
+    getPeer: vi.fn(() => null),
+    removePeer: vi.fn(),
+    incrementMissedGossip: vi.fn(),
+    resetMissedGossip: vi.fn(),
+    setPeerStatus: vi.fn(),
+    createMessageWithGlobalId: vi.fn(),
+    getPendingMessages: vi.fn(() => []),
+    markDelivered: vi.fn(),
+    hasSeenMessage: vi.fn(() => false),
+    markMessageSeen: vi.fn(),
+    purgeExpiredSeenIds: vi.fn(),
+    upsertRemoteAgent: vi.fn(),
+    // Rooms
+    createRoom: vi.fn((name: string) => {
+      if (!roomsMap.has(name)) roomsMap.set(name, new Set());
+    }),
+    joinRoom: vi.fn((roomName: string, sessionId: string) => {
+      if (!roomsMap.has(roomName)) roomsMap.set(roomName, new Set());
+      roomsMap.get(roomName)!.add(sessionId);
+    }),
+    leaveRoom: vi.fn((roomName: string, sessionId: string) => {
+      roomsMap.get(roomName)?.delete(sessionId);
+    }),
+    getRoomMembers: vi.fn((roomName: string) => {
+      return [...(roomsMap.get(roomName) ?? [])];
+    }),
+    getAgentRooms: vi.fn((sessionId: string) => {
+      const result: string[] = [];
+      for (const [name, members] of roomsMap) {
+        if (members.has(sessionId)) result.push(name);
+      }
+      return result;
+    }),
+    listRooms: vi.fn(() => {
+      return Array.from(roomsMap.entries()).map(([name, members]) => ({
+        name,
+        memberCount: members.size,
+      }));
+    }),
+    getRoomsSnapshot: vi.fn(() => {
+      return Array.from(roomsMap.entries()).map(([name, members]) => ({
+        name,
+        members: [...members],
+      }));
+    }),
+    mergeRooms: vi.fn(),
+    // Room messages
+    createRoomMessage: vi.fn((from: string, room: string, content: string, extra?: any) => {
+      const id = ++roomMsgId;
+      roomMessages.push({
+        id, global_id: "", from_agent: from, room_name: room, content,
+        timestamp: Date.now(), reply_to_id: extra?.replyToId ?? null,
+        mentions_json: extra?.mentionsJson ?? "[]",
+      });
+      return id;
+    }),
+    getRoomMessages: vi.fn((room: string, limit: number, before?: number) => {
+      let msgs = roomMessages.filter((m) => m.room_name === room);
+      if (before) msgs = msgs.filter((m) => m.timestamp < before);
+      return msgs.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+    }),
+    // Notification prefs
+    setNotifyPref: vi.fn((sessionId: string, roomName: string | null, level: string) => {
+      const key = `${sessionId}:${roomName ?? ""}`;
+      notifyPrefs.set(key, level);
+    }),
+    resolveNotifyLevel: vi.fn((sessionId: string, roomName: string) => {
+      const roomKey = `${sessionId}:${roomName}`;
+      if (notifyPrefs.has(roomKey)) return notifyPrefs.get(roomKey)!;
+      const globalKey = `${sessionId}:`;
+      if (notifyPrefs.has(globalKey)) return notifyPrefs.get(globalKey)!;
+      return "all";
+    }),
   };
 }
 
@@ -335,7 +435,7 @@ describe("server - MCP tools via client", () => {
   it("lists tools correctly", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["inbox", "listen", "message", "rename", "who"]);
+    expect(names).toEqual(["inbox", "join", "leave", "listen", "message", "notify", "read", "rename", "rooms", "who"]);
   });
 
   it("lists resources correctly", async () => {
@@ -391,5 +491,217 @@ describe("server - MCP tools via client", () => {
     const messages = JSON.parse(text);
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe("hello");
+  });
+
+  it("join creates room and adds agent as member", async () => {
+    const result = await client.callTool({ name: "join", arguments: { room: "#general" } });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    expect(text).toMatch(/Joined #general/);
+
+    const callerId = store.getOnlineAgents()[0].session_id;
+    const members = store.getRoomMembers("general");
+    expect(members).toContain(callerId);
+  });
+
+  it("leave removes agent from room", async () => {
+    await client.callTool({ name: "join", arguments: { room: "ops" } });
+    const callerId = store.getOnlineAgents()[0].session_id;
+    expect(store.getRoomMembers("ops")).toContain(callerId);
+
+    await client.callTool({ name: "leave", arguments: { room: "#ops" } });
+    expect(store.getRoomMembers("ops")).not.toContain(callerId);
+  });
+
+  it("rooms tool lists joined rooms", async () => {
+    await client.callTool({ name: "join", arguments: { room: "general" } });
+    const result = await client.callTool({ name: "rooms", arguments: {} });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const rooms = JSON.parse(text);
+    expect(rooms.length).toBeGreaterThanOrEqual(1);
+    expect(rooms[0].name).toBe("general");
+    expect(rooms[0].joined).toBe(true);
+  });
+
+  it("message to #room delivers to all room members", async () => {
+    // Auto-register caller
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    // Add bob to #general
+    store.upsertAgent({ session_id: "bob" });
+    store.joinRoom("general", "bob");
+
+    const result = await client.callTool({
+      name: "message",
+      arguments: { to: "#general", content: "hello room" },
+    });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    expect(text).toMatch(/#general/);
+
+    // Bob should have the message
+    const bobMsgs = store.getUnreadMessages("bob");
+    const roomMsg = bobMsgs.find((m) => m.content === "hello room");
+    expect(roomMsg).toBeDefined();
+    expect(roomMsg!.room).toBe("general");
+    expect(roomMsg!.msg_type).toBe("room");
+  });
+
+  it("@mention in DM sends mention copy to mentioned agent", async () => {
+    await client.callTool({ name: "who", arguments: {} });
+
+    store.upsertAgent({ session_id: "bob", name: "bob" });
+    store.upsertAgent({ session_id: "carol", name: "carol" });
+
+    await client.callTool({
+      name: "message",
+      arguments: { to: "bob", content: "hey @carol look at this" },
+    });
+
+    // Carol should get a mention copy
+    const carolMsgs = store.getUnreadMessages("carol");
+    const mention = carolMsgs.find((m) => m.msg_type === "mention");
+    expect(mention).toBeDefined();
+    expect(mention!.content).toBe("hey @carol look at this");
+  });
+
+  it("reply_to stores reply_to_id and notifies original sender", async () => {
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    // Bob sends a message to the caller
+    store.upsertAgent({ session_id: "bob", name: "bob" });
+    const originalId = store.createMessage("bob", callerId, "original message");
+
+    // Caller replies to bob's message
+    await client.callTool({
+      name: "message",
+      arguments: { to: "bob", content: "I agree", reply_to: originalId },
+    });
+
+    // Bob should get the reply with reply_to_id set
+    const bobMsgs = store.getUnreadMessages("bob");
+    const reply = bobMsgs.find((m) => m.content === "I agree");
+    expect(reply).toBeDefined();
+    expect(reply!.reply_to_id).toBe(originalId);
+  });
+
+  it("inbox exposes id, room, and type fields", async () => {
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    store.createMessage("bob", callerId, "room msg", { room: "general", msgType: "room" });
+
+    const result = await client.callTool({ name: "inbox", arguments: {} });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const messages = JSON.parse(text);
+    const msg = messages.find((m: any) => m.content === "room msg");
+    expect(msg).toBeDefined();
+    expect(msg.id).toBeDefined();
+    expect(msg.room).toBe("general");
+    expect(msg.type).toBe("room");
+  });
+
+  it("who shows rooms for agents", async () => {
+    await client.callTool({ name: "join", arguments: { room: "general" } });
+    const result = await client.callTool({ name: "who", arguments: {} });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const agents = JSON.parse(text);
+    const me = agents.find((a: any) => a.me);
+    expect(me).toBeDefined();
+    expect(me.rooms).toContain("general");
+  });
+
+  it("read room returns room history", async () => {
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    // Send a room message to create history
+    store.upsertAgent({ session_id: "bob" });
+    store.joinRoom("general", "bob");
+    await client.callTool({ name: "message", arguments: { to: "#general", content: "hello room" } });
+
+    const result = await client.callTool({ name: "read", arguments: { room: "#general" } });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const msgs = JSON.parse(text);
+    expect(msgs.length).toBeGreaterThanOrEqual(1);
+    const msg = msgs.find((m: any) => m.content === "hello room");
+    expect(msg).toBeDefined();
+    expect(msg.from).toBe(callerId);
+  });
+
+  it("room fanout respects mute — no inbox copy, message in room history", async () => {
+    await client.callTool({ name: "who", arguments: {} });
+    const callerId = store.getOnlineAgents()[0].session_id;
+
+    store.upsertAgent({ session_id: "bob" });
+    store.joinRoom("general", "bob");
+
+    // Set bob to mute
+    await client.callTool({ name: "notify", arguments: { room: "#general", level: "mute" } });
+
+    // The notify pref is set on the caller, not bob. For this test we need bob muted.
+    // Use store directly since notify tool sets pref for the caller
+    store.setNotifyPref("bob", "general", "mute");
+
+    await client.callTool({ name: "message", arguments: { to: "#general", content: "silent msg" } });
+
+    // Bob should NOT have the message in inbox
+    const bobMsgs = store.getUnreadMessages("bob");
+    const silentMsg = bobMsgs.find((m) => m.content === "silent msg");
+    expect(silentMsg).toBeUndefined();
+
+    // But room history should have it
+    const roomMsgs = store.getRoomMessages("general", 50);
+    const historyMsg = roomMsgs.find((m) => m.content === "silent msg");
+    expect(historyMsg).toBeDefined();
+  });
+
+  it("room fanout respects mentions — inbox copy only if @mentioned", async () => {
+    await client.callTool({ name: "who", arguments: {} });
+
+    store.upsertAgent({ session_id: "bob", name: "bob" });
+    store.joinRoom("general", "bob");
+    store.setNotifyPref("bob", "general", "mentions");
+
+    // Send message WITHOUT mentioning bob
+    await client.callTool({ name: "message", arguments: { to: "#general", content: "general chat" } });
+    const bobMsgs1 = store.getUnreadMessages("bob");
+    expect(bobMsgs1.find((m) => m.content === "general chat")).toBeUndefined();
+
+    // Send message WITH @bob mention
+    await client.callTool({ name: "message", arguments: { to: "#general", content: "hey @bob check this" } });
+    const bobMsgs2 = store.getUnreadMessages("bob");
+    expect(bobMsgs2.find((m) => m.content === "hey @bob check this")).toBeDefined();
+  });
+
+  it("notify tool sets per-room and global prefs", async () => {
+    // Per-room
+    const r1 = await client.callTool({ name: "notify", arguments: { room: "#general", level: "mentions" } });
+    const t1 = (r1.content as Array<{ type: string; text: string }>)[0].text;
+    expect(t1).toBe("#general notifications: mentions");
+
+    // Global
+    const r2 = await client.callTool({ name: "notify", arguments: { level: "mute" } });
+    const t2 = (r2.content as Array<{ type: string; text: string }>)[0].text;
+    expect(t2).toBe("Global default: mute");
+  });
+
+  it("rooms tool shows notify field per room", async () => {
+    await client.callTool({ name: "join", arguments: { room: "general" } });
+    await client.callTool({ name: "notify", arguments: { room: "#general", level: "mentions" } });
+
+    const result = await client.callTool({ name: "rooms", arguments: {} });
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const rooms = JSON.parse(text);
+    const general = rooms.find((r: any) => r.name === "general");
+    expect(general).toBeDefined();
+    expect(general.notify).toBe("mentions");
+  });
+
+  it("lists tools includes read and notify", async () => {
+    const result = await client.listTools();
+    const names = result.tools.map((t) => t.name).sort();
+    expect(names).toContain("read");
+    expect(names).toContain("notify");
   });
 });

@@ -1,0 +1,12 @@
+name = "agent-hotline-mesh"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+routes = [
+  { pattern = "hotline.clawfight.live", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hotline-mesh"
+database_id = "33c87fb4-ff30-4733-abe2-a08187e798ac"
