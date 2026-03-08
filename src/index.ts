@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
+import pkg from "../package.json" with { type: "json" };
 import { createStore } from "./store.js";
 import { createServer } from "./server.js";
 import { startPresenceLoop } from "./presence.js";
@@ -89,7 +90,7 @@ const program = new Command();
 program
   .name("agent-hotline")
   .description("Cross-machine agent communication - MSN Messenger for coding agents")
-  .version(require("../package.json").version);
+  .version(pkg.version);
 
 // ── serve ──
 program
