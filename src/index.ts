@@ -89,7 +89,7 @@ const program = new Command();
 program
   .name("agent-hotline")
   .description("Cross-machine agent communication - MSN Messenger for coding agents")
-  .version("0.1.0");
+  .version(require("../package.json").version);
 
 // ── serve ──
 program
