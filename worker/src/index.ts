@@ -71,9 +71,60 @@ export default {
       return handleMessage(request, env);
     }
 
+    if (url.pathname === "/api/poll" && request.method === "POST") {
+      return handlePoll(request, env);
+    }
+
     return Response.json({ error: "Not found" }, { status: 404 });
   },
 };
+
+/**
+ * Long-poll for store-and-forward messages addressed to the caller's agents.
+ * Holds the request up to ~20s and returns as soon as something arrives,
+ * giving NAT'd nodes near-instant delivery instead of waiting for the next
+ * gossip round.
+ */
+async function handlePoll(request: Request, env: Env): Promise<Response> {
+  let body: { nodeId?: string; agents?: string[] };
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "Invalid JSON" }, { status: 400 });
+  }
+  const agents = Array.isArray(body.agents) ? body.agents.slice(0, 100) : [];
+  if (agents.length === 0) {
+    return Response.json({ messages: [] });
+  }
+
+  const placeholders = agents.map(() => "?").join(",");
+  const selectStmt = `SELECT * FROM messages WHERE to_agent IN (${placeholders}) LIMIT 50`;
+  const deadline = Date.now() + 20_000;
+
+  for (;;) {
+    const pending = await env.DB.prepare(selectStmt).bind(...agents).all();
+    const rows = pending.results ?? [];
+    if (rows.length > 0) {
+      for (const row of rows) {
+        await env.DB.prepare("DELETE FROM messages WHERE global_id = ?").bind((row as any).global_id).run();
+      }
+      return Response.json({
+        messages: rows.map((m: any) => ({
+          globalId: m.global_id,
+          from: m.from_agent,
+          to: m.to_agent,
+          content: m.content,
+          originNode: m.origin_node,
+          ttl: m.ttl - 1,
+        })),
+      });
+    }
+    if (Date.now() >= deadline) {
+      return Response.json({ messages: [] });
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
 
 async function handleGossip(request: Request, env: Env): Promise<Response> {
   const payload: GossipPayload = await request.json();
