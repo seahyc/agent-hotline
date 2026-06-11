@@ -584,10 +584,12 @@ program
     const key = getAuthKey(opts);
 
     try {
+      // Mesh sends may try several peers before settling on queued delivery
       const result = await fetchJson(`${serverUrl}/api/message`, {
         method: "POST",
         headers: authHeaders(key),
         body: JSON.stringify({ from, to, content }),
+        timeoutMs: 20_000,
       }) as Record<string, unknown>;
 
       emit(opts.json, result, () => {

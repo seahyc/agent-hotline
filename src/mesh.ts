@@ -45,7 +45,9 @@ export function createMeshRouter(store: Store, opts: { clusterKey: string }): Me
           Authorization: `Bearer ${clusterKey}`,
         },
         body: JSON.stringify(msg),
-        signal: AbortSignal.timeout(10_000),
+        // Keep this short: route() tries peers sequentially, and the sender's
+        // CLI is waiting on the whole chain.
+        signal: AbortSignal.timeout(4_000),
       });
       return res.ok;
     } catch {
