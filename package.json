@@ -7,7 +7,8 @@
     "agent-hotline": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc && cp src/hook.sh dist/hook.sh",
+    "build": "tsc && cp src/hook.sh dist/hook.sh && chmod +x dist/index.js",
+    "prepublishOnly": "rm -rf dist && npm run build",
     "dev": "tsx watch src/index.ts serve --port 3456",
     "test": "vitest run",
     "test:watch": "vitest"
