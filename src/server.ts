@@ -1,18 +1,20 @@
-import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { basename } from "node:path";
 import express from "express";
-import { z } from "zod";
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Store, EventType } from "./store.js";
 import { log } from "./log.js";
-import { getClientPid, getClientPidWithRetry } from "./pid.js";
 import { resolveSessionId } from "./identity.js";
-import { resolveContext, isPidAlive } from "./context.js";
+import { resolveContext, resolveContextForCwd, isPidAlive } from "./context.js";
 import { hostname } from "node:os";
 import { getNodeId } from "./node.js";
 import { buildGossipPayload, mergeGossip, hashClusterKey } from "./peers.js";
 import { createMeshRouter, type MeshRouter } from "./mesh.js";
+import { addSseClient, removeSseClient, notifySseClients, type SseClient } from "./sse.js";
+import { UI_HTML } from "./ui.js";
+
+const require = createRequire(import.meta.url);
+const pkgVersion: string = require("../package.json").version;
 
 /** Extract @mentioned session_ids from content. */
 function extractMentions(content: string, store: Store): string[] {
@@ -27,20 +29,121 @@ function notifySubscribers(store: Store, event: EventType, subjectAgent: string,
   const subscribers = store.getSubscribers(event);
   for (const sub of subscribers) {
     if (sub !== subjectAgent) {
-      store.createMessage("system", sub, text);
+      const msgId = store.createMessage("system", sub, text);
+      const msg = store.getMessage(msgId);
+      if (msg) notifySseClients(sub, msg);
     }
   }
 }
 
-const INSTRUCTIONS = `Agent Hotline - Cross-machine agent communication.
-Your identity and context are auto-resolved from your connection.
-At the START of each session:
-1. Call \`who\` to see other online agents.
-2. Call \`inbox\` to read unread messages.
-3. Call \`listen\` and run the returned command in background to receive messages in real-time.
-   If \`listen\` tells you background listeners aren't supported, call \`inbox\` at the start of every turn instead.
-IMPORTANT: When a background listener wakes you with a message, call \`listen\` again after processing it.
-You MUST always have a listener running. Every time you process a message, immediately call \`listen\` again. Never leave yourself without a listener.`;
+/** Sanitize a free-form string (tab title, folder name) into a valid agent name. */
+export function sanitizeName(raw: string): string {
+  return raw.trim().replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+}
+
+/**
+ * Give an unnamed agent a legible default name: terminal tab title if known,
+ * else the cwd folder name. Collisions get a short session-id suffix, so
+ * multiple agents in the same directory stay distinguishable.
+ */
+function autoNameAgent(store: Store, sessionId: string, title?: string, cwd?: string): void {
+  const agent = store.getAgent(sessionId);
+  if (!agent) return;
+
+  // A tab rename should propagate: re-derive when the stored title changed and
+  // the current name was itself derived from the old title (manual renames survive).
+  const titleChanged = title && title !== agent.title;
+  const nameWasFromTitle = agent.name !== "" && agent.title !== "" &&
+    (agent.name === sanitizeName(agent.title) || agent.name.startsWith(`${sanitizeName(agent.title)}-`));
+  if (agent.name && !(titleChanged && nameWasFromTitle)) {
+    if (titleChanged) store.upsertAgent({ session_id: sessionId, title });
+    return;
+  }
+
+  const base = sanitizeName(title || (cwd ? basename(cwd) : ""));
+  if (!base) return;
+
+  let name = base;
+  let existing = store.resolveAgent(name);
+  if (existing && existing.session_id !== sessionId) {
+    name = `${base.slice(0, 27)}-${sessionId.slice(0, 4)}`;
+    existing = store.resolveAgent(name);
+    if (existing && existing.session_id !== sessionId) return; // give up, keep session_id
+  }
+  store.renameAgent(sessionId, name);
+  if (title) store.upsertAgent({ session_id: sessionId, title });
+  log("info", `auto-named ${sessionId} -> "${name}" (${title ? "tab title" : "cwd"})`);
+}
+
+// PIDs that recently failed to resolve — skip for a while instead of re-running
+// lsof/ps against them on every scan.
+const scanFailures = new Map<number, number>();
+const SCAN_FAILURE_TTL_MS = 10 * 60 * 1000;
+
+// PIDs already mapped to a session. Apps like the Codex desktop spawn several
+// matching processes for one session; only one PID can live in the agents row,
+// so without this cache the others would re-resolve (lsof/ps) every scan.
+const scanResolved = new Map<number, string>();
+
+/** Scan for running Claude Code and Codex agents and auto-register them. */
+export async function scanForAgents(store: Store): Promise<void> {
+  try {
+    // Match the executable word itself (claude / codex), not any process whose
+    // args merely mention them (MCP servers, helpers, this CLI...).
+    const raw = execSync(String.raw`pgrep -f "(^|[ /])(claude|codex)( |$)" 2>/dev/null || true`, { encoding: "utf-8", timeout: 5000 });
+    const pids = raw.split("\n").map(Number).filter(n => n > 0 && n !== process.pid);
+    const now = Date.now();
+
+    const livePids = new Set(pids);
+
+    for (const pid of pids) {
+      if (scanResolved.has(pid)) continue;
+      const existing = store.getAgentByPid(pid);
+      if (existing) {
+        scanResolved.set(pid, existing.session_id);
+        continue;
+      }
+
+      const failedAt = scanFailures.get(pid);
+      if (failedAt && now - failedAt < SCAN_FAILURE_TTL_MS) continue;
+
+      const sessionId = await resolveSessionId(pid, store);
+      if (!sessionId) {
+        scanFailures.set(pid, now);
+        continue;
+      }
+      scanFailures.delete(pid);
+      scanResolved.set(pid, sessionId);
+
+      // Another PID of the same session already registered? Don't fight over the row.
+      const knownSession = store.getAgent(sessionId);
+      if (knownSession && knownSession.online && knownSession.pid !== pid) continue;
+
+      const ctx = await resolveContext(pid, sessionId);
+      store.upsertAgent({
+        session_id: sessionId,
+        pid,
+        agent_type: ctx.agent_type,
+        machine: ctx.machine,
+        cwd: ctx.cwd,
+        cwd_remote: ctx.cwd_remote,
+        branch: ctx.branch,
+      });
+      autoNameAgent(store, sessionId, undefined, ctx.cwd);
+      log("info", `auto-discovered: ${sessionId} (PID ${pid})`);
+    }
+
+    // Drop entries for processes that are gone, and stale failures
+    for (const pid of scanResolved.keys()) {
+      if (!livePids.has(pid)) scanResolved.delete(pid);
+    }
+    for (const [pid, ts] of scanFailures) {
+      if (now - ts > SCAN_FAILURE_TTL_MS) scanFailures.delete(pid);
+    }
+  } catch (e) {
+    log("warn", `scanForAgents failed: ${e}`);
+  }
+}
 
 export function createServer(store: Store, opts?: {
   authKey?: string;
@@ -48,652 +151,26 @@ export function createServer(store: Store, opts?: {
   clusterKey?: string;
   bootstrapUrls?: string[];
 }) {
-  // Auth is always enforced. Auto-generate a master key if none provided.
   const masterKey = opts?.authKey ?? store.createApiKey("master-auto");
-
-  // Register the provided master key as an API key (auto-generated ones are already stored)
   if (opts?.authKey && !store.validateApiKey(opts.authKey)) {
     store.addApiKey(opts.authKey, "master");
   }
-  const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  // Mesh router (only active when cluster key is set)
   const clusterKey = opts?.clusterKey;
   let meshRouter: MeshRouter | null = null;
   if (clusterKey) {
     meshRouter = createMeshRouter(store, { clusterKey });
   }
 
-  const getServer = (clientPid?: number | null, remotePort?: number | null) => {
-    let sessionAgent: string | null = null;
-
-    /** Auto-register this agent on first tool call, re-resolve if PID died (session replaced). */
-    const ensureRegistered = (): string => {
-      if (sessionAgent) {
-        // Re-check: if our agent's PID is dead, the session may have been replaced (e.g. context cleared)
-        const current = store.getAgent(sessionAgent);
-        if (current && current.pid && !isPidAlive(current.pid)) {
-          log("info", `session ${sessionAgent} PID ${current.pid} is dead, re-resolving identity`);
-          store.markOffline(sessionAgent);
-          sessionAgent = null;
-          // fall through to re-resolve
-        } else {
-          return sessionAgent;
-        }
-      }
-
-      // Resolve identity: PID-based > heartbeat fallback > auto-generate
-      let resolvedPid = clientPid;
-      let resolvedId: string | undefined;
-      let wasResolved = false;
-
-      // Lazy PID retry: if PID was null at init, try again now
-      if (!resolvedPid && remotePort) {
-        resolvedPid = getClientPid(opts?.port ?? 3456, remotePort);
-        if (resolvedPid) {
-          log("info", `lazy pid resolved: remote port ${remotePort} -> PID ${resolvedPid}`);
-        }
-      }
-
-      if (resolvedPid) {
-        resolvedId = resolveSessionId(resolvedPid, store) ?? undefined;
-        if (resolvedId) wasResolved = true;
-      }
-
-      // Heartbeat fallback: find a recently registered online agent
-      if (!resolvedId) {
-        const recent = store.getRecentOnlineAgent();
-        if (recent) {
-          resolvedId = recent.session_id;
-          wasResolved = true;
-          log("info", `identity resolved via heartbeat fallback: ${resolvedId} (PID ${recent.pid})`);
-        }
-      }
-
-      if (!resolvedId) {
-        resolvedId = randomUUID();
-        log("info", `auto-register generated session_id: ${resolvedId}`);
-      }
-
-      sessionAgent = resolvedId;
-      const existing = store.getAgent(resolvedId);
-      const wasOffline = !existing || !existing.online;
-
-      // If resolved from DB and the existing PID is still alive, keep it
-      // (the hook's PID is authoritative). Otherwise update with what we have.
-      if (wasResolved && existing && existing.pid && isPidAlive(existing.pid)) {
-        store.touchAgent(resolvedId);
-      } else {
-        store.upsertAgent({
-          session_id: resolvedId,
-          pid: resolvedPid ?? 0,
-        });
-      }
-
-      if (wasOffline) {
-        log("info", `auto-register ${resolvedId} (PID ${resolvedPid}) - came online`);
-        notifySubscribers(store, "agent_online", resolvedId,
-          `${resolvedId} is now online`);
-      }
-
-      return resolvedId;
-    };
-
-    const mcpServer = new McpServer(
-      { name: "hotline", version: "0.1.0" },
-      { instructions: INSTRUCTIONS },
-    );
-
-    // ── Tool: who ──
-    mcpServer.registerTool("who", {
-      description: "See online agents. Filters: `repo` (substring match on git remote URL), `branch` (exact match), `cwd` (substring match on working directory). Set `all: true` to include offline agents.",
-      inputSchema: {
-        repo: z.string().optional().describe("Filter by git remote URL (substring match, e.g. 'agent-hotline' or 'github.com:user/repo')"),
-        branch: z.string().optional().describe("Filter by git branch (exact match)"),
-        cwd: z.string().optional().describe("Filter by working directory (substring match)"),
-        all: z.boolean().optional().default(false),
-      },
-    }, async (args) => {
-      ensureRegistered();
-      let agents = args.all ? store.getAgents() : store.getOnlineAgents();
-
-      // Auto-prune: mark agents with dead PIDs as offline (local agents only)
-      const localHost = hostname();
-      agents = agents.filter((a) => {
-        const isLocal = !a.machine || a.machine === localHost;
-        if (a.online && a.pid && isLocal && !isPidAlive(a.pid)) {
-          log("info", `auto-prune: PID ${a.pid} (${a.session_id}) is dead, marking offline`);
-          store.markOffline(a.session_id);
-          notifySubscribers(store, "agent_offline", a.session_id, `${a.session_id} went offline (process exited)`);
-          if (args.all) {
-            a.online = 0;
-            return true;
-          }
-          return false;
-        }
-        return true;
-      });
-
-      // Resolve live context for local agents only; remote agents use DB-stored context
-      const enriched = agents.map((a) => {
-        const isLocal = !a.machine || a.machine === localHost;
-        const live = a.pid && a.online && isLocal ? resolveContext(a.pid, a.session_id) : null;
-        return { agent: a, live };
-      });
-
-      let filtered = enriched;
-
-      if (args.cwd) {
-        const f = args.cwd.toLowerCase();
-        filtered = filtered.filter(({ agent: a, live }) => {
-          const cwd = live?.cwd || a.cwd || "";
-          return cwd.toLowerCase().includes(f);
-        });
-      }
-
-      if (args.repo) {
-        const f = args.repo.toLowerCase();
-        filtered = filtered.filter(({ agent: a, live }) => {
-          const remote = live?.cwd_remote || a.cwd_remote || "";
-          return remote.toLowerCase().includes(f);
-        });
-      }
-
-      if (args.branch) {
-        filtered = filtered.filter(({ agent: a, live }) => {
-          const branch = live?.branch || a.branch || "";
-          return branch === args.branch;
-        });
-      }
-
-      const list = filtered.map(({ agent: a, live }) => {
-        const agentRooms = store.getAgentRooms(a.session_id);
-        return {
-          id: a.session_id,
-          name: a.name || undefined,
-          me: a.session_id === sessionAgent || undefined,
-          type: live?.agent_type || a.agent_type || undefined,
-          machine: live?.machine || a.machine || undefined,
-          cwd: live?.cwd || a.cwd || undefined,
-          cwd_remote: live?.cwd_remote || a.cwd_remote || undefined,
-          branch: live?.branch || a.branch || undefined,
-          dirty_files: live?.dirty_files ?? JSON.parse(a.dirty_files || "[]"),
-          background_processes: live?.background_processes ?? JSON.parse(a.background_processes || "[]"),
-          pid: a.pid || undefined,
-          unread: store.getUnreadMessages(a.session_id).length || undefined,
-          rooms: agentRooms.length > 0 ? agentRooms : undefined,
-          last_seen: a.last_seen,
-          online: a.online,
-        };
-      });
-      return {
-        content: [{ type: "text", text: JSON.stringify(list, null, 2) }],
-      };
-    });
-
-    // ── Tool: rename ──
-    mcpServer.registerTool("rename", {
-      description: "Set a friendly name for an agent. Names are global and visible to all. Use names instead of UUIDs when sending messages.",
-      inputSchema: {
-        agent: z.string().describe("Session ID or current name of the agent to rename"),
-        name: z.string().describe("Friendly name (letters, digits, hyphens, underscores, max 32 chars)"),
-      },
-    }, async (args) => {
-      ensureRegistered();
-      if (!/^[a-zA-Z0-9_-]+$/.test(args.name) || args.name.length > 32) {
-        return { content: [{ type: "text", text: "Invalid name. Use letters, digits, hyphens, underscores only (max 32 chars)." }] };
-      }
-      const target = store.resolveAgent(args.agent);
-      if (!target) {
-        return { content: [{ type: "text", text: `Agent not found: ${args.agent}` }] };
-      }
-      // Check uniqueness
-      const existing = store.resolveAgent(args.name);
-      if (existing && existing.session_id !== target.session_id) {
-        return { content: [{ type: "text", text: `Name "${args.name}" is already taken by another agent.` }] };
-      }
-      store.renameAgent(target.session_id, args.name);
-      return { content: [{ type: "text", text: `Renamed ${target.session_id} to "${args.name}"` }] };
-    });
-
-    // ── Tool: message ──
-    mcpServer.registerTool("message", {
-      description: "Send a message to another agent by name or ID, '#room' for room messages, or '*' to broadcast. Supports @mentions in content and reply threading.",
-      inputSchema: {
-        to: z.string().describe("Recipient: agent name/ID, '#room' for room message, or '*' for broadcast"),
-        content: z.string(),
-        reply_to: z.number().optional().describe("Message ID to reply to (from inbox)"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-      const mentionedIds = extractMentions(args.content, store);
-
-      // Helper: send mention copies to agents not already receiving the message
-      const sendMentionCopies = (excludeIds: Set<string>) => {
-        for (const mid of mentionedIds) {
-          if (mid !== id && !excludeIds.has(mid)) {
-            store.createMessage(id, mid, args.content, { msgType: "mention", mentionsJson: JSON.stringify(mentionedIds) });
-          }
-        }
-      };
-
-      // Helper: send reply notification to original sender
-      const sendReplyNotify = (excludeIds: Set<string>) => {
-        if (!args.reply_to) return;
-        const original = store.getMessage(args.reply_to);
-        if (original && original.from_agent !== id && !excludeIds.has(original.from_agent)) {
-          store.createMessage(id, original.from_agent, args.content, {
-            replyToId: args.reply_to, msgType: "reply_notify",
-          });
-        }
-      };
-
-      // Room message
-      if (args.to.startsWith("#")) {
-        const roomName = args.to.slice(1);
-        // Auto-join sender to room
-        store.joinRoom(roomName, id);
-
-        // Write canonical room history entry
-        store.createRoomMessage(id, roomName, args.content, {
-          replyToId: args.reply_to, mentionsJson: JSON.stringify(mentionedIds),
-        });
-
-        const members = store.getRoomMembers(roomName);
-        const recipientSet = new Set(members);
-        let count = 0;
-        for (const member of members) {
-          if (member !== id) {
-            const level = store.resolveNotifyLevel(member, roomName);
-            const isMentioned = mentionedIds.includes(member);
-            if (level === "all" || (level === "mentions" && isMentioned)) {
-              store.createMessage(id, member, args.content, {
-                room: roomName, msgType: "room", replyToId: args.reply_to ?? undefined,
-                mentionsJson: JSON.stringify(mentionedIds),
-              });
-              count++;
-            }
-            // "mute" → skip inbox entirely (still in room history)
-          }
-        }
-        // Mention copies for agents NOT in the room
-        sendMentionCopies(recipientSet);
-        sendReplyNotify(recipientSet);
-        log("info", `mcp room message from ${id} to #${roomName} (${count} notified)`);
-        return {
-          content: [{ type: "text", text: `Message sent to #${roomName} (${count} notified)` }],
-        };
-      }
-
-      // Broadcast
-      if (args.to === "*") {
-        const agents = store.getOnlineAgents();
-        const recipientSet = new Set<string>();
-        let count = 0;
-        for (const a of agents) {
-          if (a.session_id !== id) {
-            recipientSet.add(a.session_id);
-            if (meshRouter) {
-              await meshRouter.route(id, a.session_id, args.content);
-            } else {
-              store.createMessage(id, a.session_id, args.content, {
-                replyToId: args.reply_to ?? undefined,
-                mentionsJson: JSON.stringify(mentionedIds),
-              });
-            }
-            count++;
-          }
-        }
-        sendMentionCopies(recipientSet);
-        sendReplyNotify(recipientSet);
-        log("info", `mcp broadcast from ${id} to ${count} agents`);
-        return {
-          content: [{ type: "text", text: `Broadcast sent to ${count} online agent(s)` }],
-        };
-      }
-
-      // Direct message
-      if (meshRouter) {
-        const result = await meshRouter.route(id, args.to, args.content);
-        log("info", `mcp message ${id} -> ${result.target} (${result.method})`);
-        const recipientSet = new Set([result.target]);
-        sendMentionCopies(recipientSet);
-        sendReplyNotify(recipientSet);
-        const label = result.delivered
-          ? `Message sent to ${result.target}`
-          : `Message queued for ${result.target} (will deliver when online)`;
-        return { content: [{ type: "text", text: label }] };
-      }
-      const resolved = store.resolveAgent(args.to);
-      const target = resolved?.session_id ?? args.to;
-      store.createMessage(id, target, args.content, {
-        replyToId: args.reply_to ?? undefined,
-        mentionsJson: JSON.stringify(mentionedIds),
-      });
-      const recipientSet = new Set([target]);
-      sendMentionCopies(recipientSet);
-      sendReplyNotify(recipientSet);
-      log("info", `mcp message ${id} -> ${target}`);
-      return {
-        content: [{ type: "text", text: `Message sent to ${resolved?.name || target}` }],
-      };
-    });
-
-    // ── Tool: inbox ──
-    mcpServer.registerTool("inbox", {
-      description: "Read your messages. Defaults to unread only. Use `status: 'all'` to see all messages, or `status: 'read'` for read-only.",
-      inputSchema: {
-        status: z.enum(["unread", "read", "all"]).optional().default("unread").describe("Filter by read status"),
-        limit: z.number().optional().default(20).describe("Max messages to return (newest first for read/all)"),
-        before: z.string().optional().describe("ISO timestamp cursor - fetch messages older than this (for pagination)"),
-        mark_read: z.boolean().optional().default(true).describe("Mark returned unread messages as read"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-      let messages: { from_agent: string; content: string; timestamp: number; read: number }[];
-
-      const beforeTs = args.before ? new Date(args.before).getTime() : undefined;
-
-      if (args.status === "unread") {
-        messages = store.getUnreadMessages(id);
-        if (beforeTs) {
-          messages = messages.filter((m) => m.timestamp < beforeTs);
-        }
-        if (messages.length > args.limit) {
-          messages = messages.slice(0, args.limit);
-        }
-      } else {
-        const all = store.getMessages(id, args.limit, beforeTs);
-        if (args.status === "read") {
-          messages = all.filter((m) => m.read === 1);
-        } else {
-          messages = all;
-        }
-      }
-
-      if (args.mark_read && args.status !== "read") {
-        store.markRead(id);
-      }
-
-      const trimmed = messages.map((m: any) => ({
-        id: m.id,
-        from: m.from_agent,
-        from_name: store.getAgent(m.from_agent)?.name || undefined,
-        content: m.content,
-        time: new Date(m.timestamp).toISOString(),
-        ...(args.status !== "unread" ? { read: !!m.read } : {}),
-        ...(m.room ? { room: m.room } : {}),
-        ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
-        ...(m.msg_type && m.msg_type !== "direct" ? { type: m.msg_type } : {}),
-      }));
-      return {
-        content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
-      };
-    });
-
-    // ── Tool: listen ──
-    mcpServer.registerTool("listen", {
-      description: [
-        "Get a background polling command that watches your inbox and exits when a message arrives.",
-        "Run the returned command as a background process. When it exits, you will be woken up with the message.",
-        "CRITICAL: After processing the message, you MUST call `listen` again immediately to resume monitoring.",
-        "Never leave yourself without a running listener - call `listen` again every single time.",
-      ].join(" "),
-      inputSchema: {
-        poll_interval: z.number().optional().default(3),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-
-      // Codex can't wake agents from background processes - guide them to poll inbox instead
-      const ctx = clientPid ? resolveContext(clientPid, id) : null;
-      if (ctx?.agent_type === "codex") {
-        return {
-          content: [{ type: "text", text: [
-            "Background listeners are not supported in Codex (background processes cannot wake the agent).",
-            "Instead, call `inbox` at the START of every turn to check for new messages.",
-            "This is your only way to receive messages - make it a habit.",
-          ].join("\n") }],
-        };
-      }
-
-      const serverUrl = `http://localhost:${opts?.port ?? 3456}`;
-      // Bake all values directly into the command so it works even when
-      // wrapped in subshells (nohup, zsh -c, etc.) by different clients.
-      const authKey = masterKey;
-      const authFlag = authKey ? `-H "Authorization: Bearer ${authKey}"` : "";
-      const inboxToken = store.getOrCreateInboxToken(id, 24 * 60 * 60 * 1000);
-      const inboxUrl = `${serverUrl}/api/inbox/${id}?mark_read=false&token=${inboxToken}`;
-      const cmd = [
-        `while true; do`,
-        `  MSGS=$(curl ${authFlag} -sf "${inboxUrl}" 2>/dev/null)`,
-        `  if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ]; then`,
-        `    echo "$MSGS" | jq -r '.[] | "[\\(.from_agent)] \\(.content)"' 2>/dev/null`,
-        `    exit 0`,
-        `  fi`,
-        `  sleep ${args.poll_interval}`,
-        `done`,
-      ].join("\n");
-      return {
-        content: [{ type: "text", text: [
-          `Run this command in a PERSISTENT background process to listen for messages:`,
-          ``,
-          cmd,
-          ``,
-          `IMPORTANT: This must run as a long-lived background process that survives between your turns.`,
-          `- Claude Code: run with run_in_background or equivalent background shell.`,
-          `- Codex: run in a background terminal session (the persistent /ps terminal feature). Do NOT use nohup, &, or disown - those get killed by the sandbox.`,
-          `- Other clients: use whatever mechanism keeps a process alive across turns.`,
-          ``,
-          `When this exits with a message, process it then IMMEDIATELY call \`listen\` again. You must ALWAYS have a listener running.`,
-        ].join("\n") }],
-      };
-    });
-
-    // ── Tool: join ──
-    mcpServer.registerTool("join", {
-      description: "Join a room (creates it if it doesn't exist). Room names can be given as '#general' or 'general'.",
-      inputSchema: {
-        room: z.string().describe("Room name, e.g. '#general' or 'general'"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-      const roomName = args.room.replace(/^#/, "");
-      store.joinRoom(roomName, id);
-      const members = store.getRoomMembers(roomName);
-      return {
-        content: [{ type: "text", text: `Joined #${roomName} (${members.length} member(s))` }],
-      };
-    });
-
-    // ── Tool: leave ──
-    mcpServer.registerTool("leave", {
-      description: "Leave a room.",
-      inputSchema: {
-        room: z.string().describe("Room name, e.g. '#general' or 'general'"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-      const roomName = args.room.replace(/^#/, "");
-      store.leaveRoom(roomName, id);
-      return {
-        content: [{ type: "text", text: `Left #${roomName}` }],
-      };
-    });
-
-    // ── Tool: rooms ──
-    mcpServer.registerTool("rooms", {
-      description: "List rooms. By default shows only your rooms; set `all: true` to see all rooms.",
-      inputSchema: {
-        all: z.boolean().optional().default(false).describe("Show all rooms (not just joined)"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-      const myRooms = new Set(store.getAgentRooms(id));
-      const allRooms = store.listRooms();
-      const filtered = args.all ? allRooms : allRooms.filter((r) => myRooms.has(r.name));
-      const result = filtered.map((r) => {
-        const members = store.getRoomMembers(r.name);
-        return {
-          name: r.name,
-          memberCount: r.memberCount,
-          members: members.map((sid) => {
-            const agent = store.getAgent(sid);
-            return { id: sid, name: agent?.name || undefined };
-          }),
-          joined: myRooms.has(r.name),
-          notify: myRooms.has(r.name) ? store.resolveNotifyLevel(id, r.name) : undefined,
-        };
-      });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    });
-
-    // ── Tool: read ──
-    mcpServer.registerTool("read", {
-      description: "Browse room history or DM thread history. Use `room` for room messages or `dm` for direct message history with another agent.",
-      inputSchema: {
-        room: z.string().optional().describe("Room name (e.g. '#general' or 'general') — browse room history"),
-        dm: z.string().optional().describe("Agent name or ID — browse DM thread history"),
-        limit: z.number().optional().default(50).describe("Max messages to return (newest first)"),
-        before: z.string().optional().describe("ISO timestamp cursor — fetch messages older than this"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-
-      if (!args.room && !args.dm) {
-        return { content: [{ type: "text", text: "Specify either `room` or `dm` to read history." }] };
-      }
-
-      const beforeTs = args.before ? new Date(args.before).getTime() : undefined;
-
-      if (args.room) {
-        const roomName = args.room.replace(/^#/, "");
-        const msgs = store.getRoomMessages(roomName, args.limit, beforeTs);
-        const result = msgs.map((m) => ({
-          id: m.id,
-          from: m.from_agent,
-          from_name: store.getAgent(m.from_agent)?.name || undefined,
-          content: m.content,
-          time: new Date(m.timestamp).toISOString(),
-          ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
-        }));
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      }
-
-      // DM history: find messages between caller and target
-      if (args.dm) {
-        const resolved = store.resolveAgent(args.dm);
-        const targetId = resolved?.session_id ?? args.dm;
-        // Get messages where caller is sender or recipient with the target
-        const myMessages = store.getMessages(id, args.limit * 2, beforeTs);
-        const theirMessages = store.getMessages(targetId, args.limit * 2, beforeTs);
-        const allMsgs = [...myMessages, ...theirMessages]
-          .filter((m) =>
-            (m.from_agent === id && m.to_agent === targetId) ||
-            (m.from_agent === targetId && m.to_agent === id)
-          )
-          .filter((m) => !m.room) // exclude room messages
-          .sort((a, b) => b.timestamp - a.timestamp)
-          .slice(0, args.limit);
-        // Deduplicate by id
-        const seen = new Set<number>();
-        const deduped = allMsgs.filter((m) => {
-          if (seen.has(m.id)) return false;
-          seen.add(m.id);
-          return true;
-        });
-        const result = deduped.map((m) => ({
-          id: m.id,
-          from: m.from_agent,
-          from_name: store.getAgent(m.from_agent)?.name || undefined,
-          content: m.content,
-          time: new Date(m.timestamp).toISOString(),
-          ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
-          ...(m.msg_type && m.msg_type !== "direct" ? { type: m.msg_type } : {}),
-        }));
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      }
-
-      return { content: [{ type: "text", text: "[]" }] };
-    });
-
-    // ── Tool: notify ──
-    mcpServer.registerTool("notify", {
-      description: "Set notification preferences for a room or globally. Levels: 'all' (every message), 'mentions' (only @mentions), 'mute' (no inbox copies). Omit `room` to set global default.",
-      inputSchema: {
-        room: z.string().optional().describe("Room name (e.g. '#general' or 'general'). Omit for global default."),
-        level: z.enum(["all", "mentions", "mute"]).describe("Notification level"),
-      },
-    }, async (args) => {
-      const id = ensureRegistered();
-      const roomName = args.room ? args.room.replace(/^#/, "") : null;
-      store.setNotifyPref(id, roomName, args.level);
-      const label = roomName ? `#${roomName} notifications` : "Global default";
-      return { content: [{ type: "text", text: `${label}: ${args.level}` }] };
-    });
-
-    // ── Resource: hotline://agents ──
-    mcpServer.registerResource("agents", "hotline://agents", {
-      description: "All registered agents",
-      mimeType: "application/json",
-    }, async () => {
-      const agents = store.getAgents();
-      return {
-        contents: [{ uri: "hotline://agents", text: JSON.stringify(agents, null, 2) }],
-      };
-    });
-
-    // ── Resource template: hotline://agent/{name}/status ──
-    mcpServer.registerResource(
-      "agent-status",
-      new ResourceTemplate("hotline://agent/{name}/status", { list: undefined }),
-      { description: "Full agent status", mimeType: "application/json" },
-      async (_uri, vars) => {
-        const name = vars.name as string;
-        const agent = store.getAgent(name);
-        return {
-          contents: [{
-            uri: `hotline://agent/${name}/status`,
-            text: agent ? JSON.stringify(agent, null, 2) : JSON.stringify({ error: "Agent not found" }),
-          }],
-        };
-      },
-    );
-
-    // ── Resource template: hotline://agent/{name}/inbox ──
-    mcpServer.registerResource(
-      "agent-inbox",
-      new ResourceTemplate("hotline://agent/{name}/inbox", { list: undefined }),
-      { description: "Unread messages for agent", mimeType: "application/json" },
-      async (_uri, vars) => {
-        const name = vars.name as string;
-        const messages = store.getUnreadMessages(name);
-        return {
-          contents: [{
-            uri: `hotline://agent/${name}/inbox`,
-            text: JSON.stringify(messages, null, 2),
-          }],
-        };
-      },
-    );
-
-    return { mcpServer, getSessionAgent: () => sessionAgent };
-  };
-
-  // ── Express app ──
   const app = express();
   app.use(express.json());
 
   // ── Auth middleware ──
   app.use((req, res, next) => {
-    // Public routes
     if (req.path === "/health" || (req.method === "POST" && req.path === "/api/connect")) {
       return next();
     }
 
-    // Localhost is trusted (agents always connect locally)
     const ip = req.ip ?? req.socket.remoteAddress ?? "";
     if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") {
       return next();
@@ -712,116 +189,59 @@ export function createServer(store: Store, opts?: {
     next();
   });
 
-  const handlePost = async (
-    req: express.Request,
-    res: express.Response,
-  ) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-    try {
-      let transport: StreamableHTTPServerTransport;
-
-      if (sessionId && transports[sessionId]) {
-        transport = transports[sessionId];
-      } else if (!sessionId && isInitializeRequest(req.body)) {
-        // Resolve client PID from the TCP socket connection
-        const remotePort = req.socket.remotePort;
-        if (!remotePort) {
-          log("warn", `MCP initialize: remotePort unavailable (socket destroyed: ${req.socket.destroyed}, readableEnded: ${req.socket.readableEnded})`);
-        }
-        const clientPid = remotePort ? await getClientPidWithRetry(opts?.port ?? 3456, remotePort) : null;
-
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (sid: string) => {
-            transports[sid] = transport;
-          },
-        });
-
-        const { mcpServer: server, getSessionAgent } = getServer(clientPid, remotePort);
-
-        transport.onclose = () => {
-          const sid = transport.sessionId;
-          if (sid && transports[sid]) {
-            delete transports[sid];
-          }
-          const agent = getSessionAgent();
-          if (agent) {
-            store.markOffline(agent);
-            notifySubscribers(store, "agent_offline", agent, `${agent} went offline`);
-          }
-        };
-
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
-        return;
-      } else {
-        res.status(400).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Bad Request: No valid session ID provided" },
-          id: req.body?.id ?? null,
-        });
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
-    } catch (error) {
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
-          id: req.body?.id ?? null,
-        });
-      }
-    }
-  };
-
-  const handleGet = async (
-    req: express.Request,
-    res: express.Response,
-  ) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      res.status(400).send("Invalid or missing session ID");
-      return;
-    }
-    await transports[sessionId].handleRequest(req, res);
-  };
-
-  const handleDelete = async (
-    req: express.Request,
-    res: express.Response,
-  ) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      res.status(400).send("Invalid or missing session ID");
-      return;
-    }
-    try {
-      await transports[sessionId].handleRequest(req, res);
-    } catch {
-      if (!res.headersSent) {
-        res.status(500).send("Error processing session termination");
-      }
-    }
-  };
-
-  app.post("/mcp", handlePost);
-  app.get("/mcp", handleGet);
-  app.delete("/mcp", handleDelete);
-
-  // Health check
+  // ── Health ──
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
   });
 
-  // ── REST API (for CLI watch/check commands) ──
+  // ── Web UI (humans) ──
+  app.get("/", (_req, res) => {
+    res.type("html").send(UI_HTML);
+  });
 
-  // GET /api/inbox/:sessionId - returns unread messages (marks read by default, ?mark_read=false to peek)
-  // Requires either a valid API key (Bearer/query) or an inbox token (?token=xxx).
-  // API key holders (hook, CLI tools) can read any inbox. Inbox tokens scope access to one agent.
+  // ── GET /api/activity ── unified firehose for the web UI
+  app.get("/api/activity", (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit as string || "100", 10), 500);
+    const rows = store.getRecentActivity(limit);
+    res.json(rows.map(r => ({
+      from: r.from_agent,
+      from_name: store.getAgent(r.from_agent)?.name || undefined,
+      to: r.to_agent || undefined,
+      to_name: r.to_agent ? (store.getAgent(r.to_agent)?.name || undefined) : undefined,
+      room: r.room || undefined,
+      content: r.content,
+      time: new Date(r.timestamp).toISOString(),
+    })));
+  });
+
+  // ── GET /api/agents ──
+  // ?online=true for online-only, optional hostname-based auto-pruning
+  app.get("/api/agents", (req, res) => {
+    const onlineOnly = req.query.online === "true";
+    const localHost = hostname();
+
+    let agents = onlineOnly ? store.getOnlineAgents() : store.getAgents();
+
+    if (onlineOnly) {
+      // Auto-prune dead local PIDs
+      agents = agents.filter(a => {
+        const isLocal = !a.machine || a.machine === localHost;
+        if (a.online && a.pid && isLocal && !isPidAlive(a.pid)) {
+          log("info", `auto-prune: PID ${a.pid} (${a.session_id}) is dead, marking offline`);
+          store.markOffline(a.session_id);
+          notifySubscribers(store, "agent_offline", a.session_id, `${a.session_id} went offline (process exited)`);
+          return false;
+        }
+        return true;
+      });
+    }
+
+    res.json(agents);
+  });
+
+  // ── GET /api/inbox/:sessionId ── (accepts a friendly name or session id)
   app.get("/api/inbox/:sessionId", (req, res) => {
-    const { sessionId } = req.params;
+    const sessionId = store.resolveAgent(req.params.sessionId)?.session_id ?? req.params.sessionId;
     const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
     const queryKey = req.query.key as string | undefined;
     const hasApiKey = (bearer && store.validateApiKey(bearer)) || (queryKey && store.validateApiKey(queryKey));
@@ -839,13 +259,60 @@ export function createServer(store: Store, opts?: {
     res.json(messages);
   });
 
-  // GET /api/agents - returns all agents
-  app.get("/api/agents", (_req, res) => {
-    const agents = store.getAgents();
-    res.json(agents);
+  // ── GET /api/sse/:sessionId ── Server-Sent Events (accepts name or session id)
+  app.get("/api/sse/:sessionId", (req, res) => {
+    const sessionId = store.resolveAgent(req.params.sessionId)?.session_id ?? req.params.sessionId;
+    const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    const queryKey = req.query.key as string | undefined;
+    const hasApiKey = (bearer && store.validateApiKey(bearer)) || (queryKey && store.validateApiKey(queryKey));
+    if (!hasApiKey) {
+      const token = req.query.token as string | undefined;
+      if (!token || !store.validateInboxToken(sessionId, token)) {
+        res.status(403).json({ error: "Invalid or missing inbox token" });
+        return;
+      }
+    }
+
+    const roomsParam = req.query.rooms as string | undefined;
+    const rooms = roomsParam ? roomsParam.split(",").map(r => r.trim()).filter(Boolean) : null;
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    res.flushHeaders();
+
+    const client: SseClient = { res, rooms };
+    addSseClient(sessionId, client);
+    log("info", `SSE connected: ${sessionId}${rooms ? ` (rooms: ${rooms.join(",")})` : ""}`);
+
+    const heartbeat = setInterval(() => {
+      res.write(": heartbeat\n\n");
+    }, 15_000);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      removeSseClient(sessionId, client);
+      log("info", `SSE disconnected: ${sessionId}`);
+    });
   });
 
-  // POST /api/heartbeat - lightweight presence signal (session_id + pid). Context is pulled on demand.
+  // ── POST /api/inbox-token ── generate scoped inbox token for listen/wait
+  app.post("/api/inbox-token", (req, res) => {
+    const { session_id } = req.body;
+    if (!session_id) {
+      res.status(400).json({ error: "session_id is required" });
+      return;
+    }
+    const resolved = store.resolveAgent(session_id)?.session_id ?? session_id;
+    const token = store.getOrCreateInboxToken(resolved, 24 * 60 * 60 * 1000);
+    res.json({ token });
+  });
+
+  // ── POST /api/heartbeat ──
+  // Body: { session_id, pid?, title?, cwd? } — title is the terminal tab name, if the
+  // hook could capture one. Responds with enough for the hook to greet the agent.
   const heartbeatHandler: express.RequestHandler = (req, res) => {
     const body = req.body;
     if (!body?.session_id) {
@@ -855,7 +322,6 @@ export function createServer(store: Store, opts?: {
     const existing = store.getAgent(body.session_id);
     const wasOffline = !existing || !existing.online;
 
-    // Session handover: if this PID was claimed by a different agent, retire it
     if (body.pid) {
       const prev = store.getAgentByPid(body.pid);
       if (prev && prev.session_id !== body.session_id) {
@@ -869,24 +335,355 @@ export function createServer(store: Store, opts?: {
     store.upsertAgent({
       session_id: body.session_id,
       pid: body.pid ?? 0,
+      ...(body.cwd ? { cwd: body.cwd } : {}),
     });
+    const title = typeof body.title === "string" ? body.title.slice(0, 128) : undefined;
+    autoNameAgent(store, body.session_id, title, body.cwd);
+
     if (wasOffline) {
       log("info", `heartbeat ${body.session_id} (PID ${body.pid ?? 0}) - came online`);
       notifySubscribers(store, "agent_online", body.session_id,
         `${body.session_id} is now online`);
     }
-    res.json({ ok: true, session_id: body.session_id });
+
+    const agent = store.getAgent(body.session_id);
+    const online = store.getOnlineAgents()
+      .filter(a => a.session_id !== body.session_id)
+      .slice(0, 50)
+      .map(a => ({ id: a.session_id, name: a.name || undefined, machine: a.machine || undefined }));
+    res.json({
+      ok: true,
+      session_id: body.session_id,
+      name: agent?.name ?? "",
+      unread: store.getUnreadMessages(body.session_id).length,
+      online,
+    });
+
+    // Refresh context (cwd, branch, agent type) off the request path — the hook
+    // has sub-second curl timeouts and must never wait on lsof/git.
+    // When the hook supplies a cwd, trust it over the process's kernel cwd:
+    // sessions sharing one claude app process all report the app's launch dir.
+    const pid = body.pid;
+    if (pid && isPidAlive(pid)) {
+      const ctxPromise = body.cwd
+        ? resolveContextForCwd(body.cwd, pid)
+        : resolveContext(pid, body.session_id);
+      ctxPromise
+        .then((ctx) => {
+          if (!ctx.cwd) return;
+          store.upsertAgent({
+            session_id: body.session_id,
+            pid,
+            agent_type: ctx.agent_type,
+            machine: ctx.machine,
+            cwd: ctx.cwd,
+            cwd_remote: ctx.cwd_remote,
+            branch: ctx.branch,
+          });
+          autoNameAgent(store, body.session_id, title, ctx.cwd);
+        })
+        .catch((e) => log("warn", `context refresh failed for ${body.session_id}: ${e}`));
+    }
   };
   app.post("/api/heartbeat", heartbeatHandler);
-  app.post("/api/checkin", heartbeatHandler); // backward compat alias
+  app.post("/api/checkin", heartbeatHandler);
 
-  // POST /api/invite - generate an invite code (requires master key)
-  app.post("/api/invite", (req, res) => {
+  // ── GET /api/status ── one-shot diagnostic: server + caller identity + inbox
+  app.get("/api/status", (req, res) => {
+    const sessionId = req.query.session_id as string | undefined;
+    const peers = store.getPeers().filter(p => p.status !== "dead");
+    const onlineAgents = store.getOnlineAgents().map(a => ({
+      id: a.session_id,
+      name: a.name || undefined,
+      machine: a.machine || undefined,
+      branch: a.branch || undefined,
+      cwd: a.cwd || undefined,
+    }));
+    const result: Record<string, unknown> = {
+      server: {
+        version: pkgVersion,
+        port: opts?.port ?? 3456,
+        mesh: !!clusterKey,
+        peers: peers.length,
+      },
+      agents_online: onlineAgents,
+    };
+    if (sessionId) {
+      const agent = store.resolveAgent(sessionId);
+      if (agent) {
+        result.agent = {
+          session_id: agent.session_id,
+          name: agent.name || undefined,
+          unread: store.getUnreadMessages(agent.session_id).length,
+          rooms: store.getAgentRooms(agent.session_id),
+        };
+      }
+    }
+    res.json(result);
+  });
+
+  // ── POST /api/resolve ── resolve session_id from a PID (for CLI identity)
+  app.post("/api/resolve", async (req, res) => {
+    const { pid } = req.body;
+    if (!pid) {
+      res.status(400).json({ error: "pid is required" });
+      return;
+    }
+    const sessionId = await resolveSessionId(Number(pid), store);
+    if (!sessionId) {
+      res.status(404).json({ error: "Could not resolve session_id for this PID" });
+      return;
+    }
+    res.json({ session_id: sessionId });
+  });
+
+  // ── POST /api/message ──
+  app.post("/api/message", async (req, res) => {
+    const body = req.body;
+
+    // Mesh relay message (from another node)
+    if (body.globalId && body.originNode && meshRouter) {
+      const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+      if (clusterKey && bearer !== clusterKey) {
+        res.status(401).json({ error: "Invalid cluster key" });
+        return;
+      }
+      const accepted = await meshRouter.receiveRelayed(body);
+      res.json({ ok: true, accepted });
+      return;
+    }
+
+    const { from, to, content } = body;
+    if (!from || !to || !content) {
+      res.status(400).json({ error: "from, to, and content are required" });
+      return;
+    }
+
+    const resolvedFrom = store.resolveAgent(from)?.session_id ?? from;
+    const mentionedIds = extractMentions(content, store);
+
+    // Room message
+    if (to.startsWith("#")) {
+      const roomName = to.slice(1);
+      store.joinRoom(roomName, resolvedFrom);
+      store.createRoomMessage(resolvedFrom, roomName, content, { mentionsJson: JSON.stringify(mentionedIds) });
+      const members = store.getRoomMembers(roomName);
+      const recipientSet = new Set(members);
+      let count = 0;
+      for (const member of members) {
+        if (member !== resolvedFrom) {
+          const level = store.resolveNotifyLevel(member, roomName);
+          const isMentioned = mentionedIds.includes(member);
+          if (level === "all" || (level === "mentions" && isMentioned)) {
+            const rmId = store.createMessage(resolvedFrom, member, content, {
+              room: roomName, msgType: "room", mentionsJson: JSON.stringify(mentionedIds),
+            });
+            const rmMsg = store.getMessage(rmId);
+            if (rmMsg) notifySseClients(member, rmMsg);
+            count++;
+          }
+        }
+      }
+      for (const mid of mentionedIds) {
+        if (mid !== resolvedFrom && !recipientSet.has(mid)) {
+          const mentionId = store.createMessage(resolvedFrom, mid, content, { msgType: "mention", mentionsJson: JSON.stringify(mentionedIds) });
+          const mentionMsg = store.getMessage(mentionId);
+          if (mentionMsg) notifySseClients(mid, mentionMsg);
+        }
+      }
+      log("info", `room message from ${resolvedFrom} to #${roomName} (${count} notified)`);
+      res.json({ ok: true, room: roomName, notified: count });
+      return;
+    }
+
+    // Broadcast
+    if (to === "*") {
+      const agents = store.getOnlineAgents();
+      let count = 0;
+      for (const a of agents) {
+        if (a.session_id !== resolvedFrom) {
+          if (meshRouter) {
+            await meshRouter.route(resolvedFrom, a.session_id, content);
+          } else {
+            const bcId = store.createMessage(resolvedFrom, a.session_id, content);
+            const bcMsg = store.getMessage(bcId);
+            if (bcMsg) notifySseClients(a.session_id, bcMsg);
+          }
+          count++;
+        }
+      }
+      log("info", `message broadcast from ${resolvedFrom} to ${count} agents`);
+      res.json({ ok: true, broadcast: count });
+      return;
+    }
+
+    // Direct message
+    if (meshRouter) {
+      const result = await meshRouter.route(resolvedFrom, to, content);
+      log("info", `message ${resolvedFrom} -> ${result.target} (${result.method})`);
+      res.json({ ok: true, to: result.target, method: result.method });
+    } else {
+      const resolvedTo = store.resolveAgent(to)?.session_id ?? to;
+      const dmId = store.createMessage(resolvedFrom, resolvedTo, content, { mentionsJson: JSON.stringify(mentionedIds) });
+      const dmMsg = store.getMessage(dmId);
+      if (dmMsg) notifySseClients(resolvedTo, dmMsg);
+      log("info", `message ${resolvedFrom} -> ${resolvedTo}`);
+      res.json({ ok: true, to: resolvedTo });
+    }
+  });
+
+  // ── POST /api/rename ──
+  app.post("/api/rename", (req, res) => {
+    const { session_id, name } = req.body;
+    if (!session_id || !name) {
+      res.status(400).json({ error: "session_id and name are required" });
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(name) || name.length > 32) {
+      res.status(400).json({ error: "Invalid name. Use letters, digits, hyphens, underscores only (max 32 chars)" });
+      return;
+    }
+    const target = store.resolveAgent(session_id);
+    if (!target) {
+      res.status(404).json({ error: `Agent not found: ${session_id}` });
+      return;
+    }
+    const existing = store.resolveAgent(name);
+    if (existing && existing.session_id !== target.session_id) {
+      res.status(409).json({ error: `Name "${name}" is already taken` });
+      return;
+    }
+    store.renameAgent(target.session_id, name);
+    res.json({ ok: true, session_id: target.session_id, name });
+  });
+
+  // ── GET /api/rooms ──
+  app.get("/api/rooms", (req, res) => {
+    const sessionId = req.query.session_id as string | undefined;
+    const all = req.query.all === "true";
+    const myRooms = sessionId ? new Set(store.getAgentRooms(sessionId)) : new Set<string>();
+    const allRooms = store.listRooms();
+    const filtered = (all || !sessionId) ? allRooms : allRooms.filter(r => myRooms.has(r.name));
+    const result = filtered.map(r => {
+      const members = store.getRoomMembers(r.name);
+      return {
+        name: r.name,
+        memberCount: r.memberCount,
+        members: members.map(sid => {
+          const agent = store.getAgent(sid);
+          return { id: sid, name: agent?.name || undefined };
+        }),
+        joined: sessionId ? myRooms.has(r.name) : undefined,
+        notify: (sessionId && myRooms.has(r.name)) ? store.resolveNotifyLevel(sessionId, r.name) : undefined,
+      };
+    });
+    res.json(result);
+  });
+
+  // ── POST /api/rooms/join ──
+  app.post("/api/rooms/join", (req, res) => {
+    const { session_id, room } = req.body;
+    if (!session_id || !room) {
+      res.status(400).json({ error: "session_id and room are required" });
+      return;
+    }
+    const roomName = (room as string).replace(/^#/, "");
+    store.joinRoom(roomName, session_id);
+    const members = store.getRoomMembers(roomName);
+    res.json({ ok: true, room: roomName, memberCount: members.length });
+  });
+
+  // ── POST /api/rooms/leave ──
+  app.post("/api/rooms/leave", (req, res) => {
+    const { session_id, room } = req.body;
+    if (!session_id || !room) {
+      res.status(400).json({ error: "session_id and room are required" });
+      return;
+    }
+    const roomName = (room as string).replace(/^#/, "");
+    store.leaveRoom(roomName, session_id);
+    res.json({ ok: true, room: roomName });
+  });
+
+  // ── GET /api/messages ── browse room or DM history
+  app.get("/api/messages", (req, res) => {
+    const sessionId = req.query.session_id as string | undefined;
+    const room = req.query.room as string | undefined;
+    const dm = req.query.dm as string | undefined;
+    const limit = Math.min(parseInt(req.query.limit as string || "50", 10), 200);
+    const before = req.query.before as string | undefined;
+    const beforeTs = before ? new Date(before).getTime() : undefined;
+
+    if (room) {
+      const roomName = room.replace(/^#/, "");
+      const msgs = store.getRoomMessages(roomName, limit, beforeTs);
+      res.json(msgs.map(m => ({
+        id: m.id,
+        from: m.from_agent,
+        from_name: store.getAgent(m.from_agent)?.name || undefined,
+        content: m.content,
+        time: new Date(m.timestamp).toISOString(),
+        ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
+      })));
+      return;
+    }
+
+    if (dm && sessionId) {
+      const resolved = store.resolveAgent(dm);
+      const targetId = resolved?.session_id ?? dm;
+      const myMessages = store.getMessages(sessionId, limit * 2, beforeTs);
+      const theirMessages = store.getMessages(targetId, limit * 2, beforeTs);
+      const allMsgs = [...myMessages, ...theirMessages]
+        .filter(m =>
+          (m.from_agent === sessionId && m.to_agent === targetId) ||
+          (m.from_agent === targetId && m.to_agent === sessionId)
+        )
+        .filter(m => !m.room)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, limit);
+      const seen = new Set<number>();
+      const deduped = allMsgs.filter(m => {
+        if (seen.has(m.id)) return false;
+        seen.add(m.id);
+        return true;
+      });
+      res.json(deduped.map(m => ({
+        id: m.id,
+        from: m.from_agent,
+        from_name: store.getAgent(m.from_agent)?.name || undefined,
+        content: m.content,
+        time: new Date(m.timestamp).toISOString(),
+        ...(m.reply_to_id ? { reply_to: m.reply_to_id } : {}),
+      })));
+      return;
+    }
+
+    res.status(400).json({ error: "Specify ?room=name or ?dm=agent&session_id=id" });
+  });
+
+  // ── POST /api/notify ──
+  app.post("/api/notify", (req, res) => {
+    const { session_id, room, level } = req.body;
+    if (!session_id || !level) {
+      res.status(400).json({ error: "session_id and level are required" });
+      return;
+    }
+    if (!["all", "mentions", "mute"].includes(level)) {
+      res.status(400).json({ error: "level must be 'all', 'mentions', or 'mute'" });
+      return;
+    }
+    const roomName = room ? (room as string).replace(/^#/, "") : null;
+    store.setNotifyPref(session_id, roomName, level);
+    res.json({ ok: true, session_id, room: roomName, level });
+  });
+
+  // ── POST /api/invite ──
+  app.post("/api/invite", (_req, res) => {
     const code = store.createInviteCode();
     res.json({ code });
   });
 
-  // POST /api/connect - redeem an invite code for an API key (public)
+  // ── POST /api/connect ──
   app.post("/api/connect", (req, res) => {
     const { code } = req.body;
     if (!code) {
@@ -901,75 +698,8 @@ export function createServer(store: Store, opts?: {
     res.json({ key });
   });
 
-  // POST /api/heartbeat - batch touch last_seen for agents from a client server
-  app.post("/api/heartbeat", (req, res) => {
-    const { agents } = req.body;
-    if (!Array.isArray(agents)) {
-      res.status(400).json({ error: "agents array is required" });
-      return;
-    }
-    for (const a of agents) {
-      if (a.name) store.touchAgent(a.name);
-    }
-    res.json({ ok: true });
-  });
-
-  // POST /api/message - send a message via REST (also handles mesh relay)
-  app.post("/api/message", async (req, res) => {
-    const body = req.body;
-
-    // Mesh relay message (from another node)
-    if (body.globalId && body.originNode && meshRouter) {
-      // Validate cluster key for inter-node messages
-      const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-      if (clusterKey && bearer !== clusterKey) {
-        res.status(401).json({ error: "Invalid cluster key" });
-        return;
-      }
-      const accepted = await meshRouter.receiveRelayed(body);
-      res.json({ ok: true, accepted });
-      return;
-    }
-
-    // Regular REST message (local origin)
-    const { from, to, content } = body;
-    if (!from || !to || !content) {
-      res.status(400).json({ error: "from, to, and content are required" });
-      return;
-    }
-    const resolvedFrom = store.resolveAgent(from)?.session_id ?? from;
-    if (to === "*") {
-      const agents = store.getOnlineAgents();
-      let count = 0;
-      for (const a of agents) {
-        if (a.session_id !== resolvedFrom) {
-          if (meshRouter) {
-            await meshRouter.route(resolvedFrom, a.session_id, content);
-          } else {
-            store.createMessage(resolvedFrom, a.session_id, content);
-          }
-          count++;
-        }
-      }
-      log("info", `message broadcast from ${resolvedFrom} to ${count} agents`);
-      res.json({ ok: true, broadcast: count });
-    } else {
-      if (meshRouter) {
-        const result = await meshRouter.route(resolvedFrom, to, content);
-        log("info", `message ${resolvedFrom} -> ${result.target} (${result.method})`);
-        res.json({ ok: true, to: result.target, method: result.method });
-      } else {
-        const resolvedTo = store.resolveAgent(to)?.session_id ?? to;
-        store.createMessage(resolvedFrom, resolvedTo, content);
-        log("info", `message ${resolvedFrom} -> ${resolvedTo}`);
-        res.json({ ok: true, to: resolvedTo });
-      }
-    }
-  });
-
-  // POST /api/gossip - mesh gossip endpoint
+  // ── POST /api/gossip ──
   app.post("/api/gossip", (req, res) => {
-    // Validate cluster key
     const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
     if (clusterKey && bearer !== clusterKey) {
       res.status(401).json({ error: "Invalid cluster key" });
@@ -986,7 +716,6 @@ export function createServer(store: Store, opts?: {
       return;
     }
 
-    // Validate cluster key hash
     const expectedHash = hashClusterKey(clusterKey);
     if (payload.clusterKeyHash && payload.clusterKeyHash !== expectedHash) {
       res.status(401).json({ error: "Cluster key mismatch" });
@@ -996,21 +725,19 @@ export function createServer(store: Store, opts?: {
     const localNodeId = getNodeId();
     mergeGossip(store, payload, localNodeId);
 
-    // Also retry pending messages when we learn about new peers
     if (meshRouter) {
       meshRouter.retryPending().catch((e) => log("error", `retry pending failed: ${e}`));
     }
 
-    // Respond with our view
     const selfAddr = `http://localhost:${opts?.port ?? 3456}`;
     const response = buildGossipPayload(store, clusterKey, selfAddr);
     res.json(response);
   });
 
-  // Catch-all: return JSON 404 (prevents Express HTML 404 from confusing MCP OAuth discovery)
+  // Catch-all: JSON 404
   app.use((_req, res) => {
     res.status(404).json({ error: "Not found" });
   });
 
-  return { app, getServer, transports, masterKey, meshRouter };
+  return { app, masterKey, meshRouter };
 }

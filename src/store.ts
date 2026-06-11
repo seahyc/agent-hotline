@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 export interface Agent {
   session_id: string;
   name: string;
+  title: string; // terminal tab title, if known
   agent_type: string;
   machine: string;
   cwd: string;
@@ -114,6 +115,8 @@ export interface Store {
     replyToId?: number; mentionsJson?: string;
   }): number;
   getRoomMessages(room: string, limit: number, before?: number): RoomMessage[];
+  /** Latest direct + room messages interleaved, newest first (for the web UI firehose). */
+  getRecentActivity(limit: number): { from_agent: string; to_agent: string; content: string; timestamp: number; room: string | null }[];
   // Notification preferences
   setNotifyPref(sessionId: string, roomName: string | null, level: string): void;
   resolveNotifyLevel(sessionId: string, roomName: string): string;
@@ -259,27 +262,19 @@ export function createStore(dbPath?: string): Store {
   try { db.exec("ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'delivered'"); } catch (_) { /* already exists */ }
   try { db.exec("ALTER TABLE agents ADD COLUMN origin_node TEXT DEFAULT ''"); } catch (_) { /* already exists */ }
   try { db.exec("ALTER TABLE agents ADD COLUMN last_seen_logical INTEGER DEFAULT 0"); } catch (_) { /* already exists */ }
+  try { db.exec("ALTER TABLE agents ADD COLUMN title TEXT DEFAULT ''"); } catch (_) { /* already exists */ }
 
-  const upsertAgentStmt = db.prepare(`
-    INSERT INTO agents (session_id, name, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
-    VALUES (@session_id, @name, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online)
-    ON CONFLICT(session_id) DO UPDATE SET
-      name = CASE WHEN @name != '' THEN @name ELSE agents.name END,
-      agent_type = @agent_type,
-      machine = @machine,
-      cwd = @cwd,
-      cwd_remote = @cwd_remote,
-      branch = @branch,
-      status = @status,
-      dirty_files = @dirty_files,
-      background_processes = @background_processes,
-      git_diff = @git_diff,
-      conversation_recent = @conversation_recent,
-      terminal = @terminal,
-      pid = @pid,
-      last_seen = @last_seen,
-      online = @online
+  const insertAgentStmt = db.prepare(`
+    INSERT INTO agents (session_id, name, title, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
+    VALUES (@session_id, @name, @title, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online)
   `);
+
+  // Fields callers may partially update; absent/undefined fields are left untouched
+  // (a bare heartbeat upsert must not wipe context resolved earlier).
+  const AGENT_UPDATE_FIELDS = [
+    "name", "title", "agent_type", "machine", "cwd", "cwd_remote", "branch", "status",
+    "dirty_files", "background_processes", "git_diff", "conversation_recent", "terminal", "pid",
+  ] as const;
 
   const getAgentsStmt = db.prepare("SELECT * FROM agents");
   const getAgentsByRoomStmt = db.prepare(
@@ -322,6 +317,9 @@ export function createStore(dbPath?: string): Store {
   );
   const purgeOldMessagesStmt = db.prepare(
     "DELETE FROM messages WHERE timestamp < ?",
+  );
+  const purgeOldRoomMessagesStmt = db.prepare(
+    "DELETE FROM room_messages WHERE timestamp < ?",
   );
   const touchAgentStmt = db.prepare(
     "UPDATE agents SET last_seen = ? WHERE session_id = ?",
@@ -407,6 +405,14 @@ export function createStore(dbPath?: string): Store {
   const getRoomMessagesBeforeStmt = db.prepare(
     "SELECT * FROM room_messages WHERE room_name = ? AND timestamp < ? ORDER BY timestamp DESC LIMIT ?"
   );
+  const getRecentActivityStmt = db.prepare(`
+    SELECT from_agent, to_agent, content, timestamp, NULL AS room
+      FROM messages WHERE room IS NULL AND msg_type = 'direct'
+    UNION ALL
+    SELECT from_agent, '' AS to_agent, content, timestamp, room_name AS room
+      FROM room_messages
+    ORDER BY timestamp DESC LIMIT ?
+  `);
 
   // Notification pref statements
   const setNotifyPrefStmt = db.prepare(
@@ -469,25 +475,40 @@ export function createStore(dbPath?: string): Store {
 
     upsertAgent(agent) {
       const now = Date.now();
-      const row = {
-        session_id: agent.session_id,
-        name: agent.name ?? "",
-        agent_type: agent.agent_type ?? "",
-        machine: agent.machine ?? "",
-        cwd: agent.cwd ?? "",
-        cwd_remote: agent.cwd_remote ?? "",
-        branch: agent.branch ?? "",
-        status: agent.status ?? "",
-        dirty_files: agent.dirty_files ?? "[]",
-        background_processes: agent.background_processes ?? "[]",
-        git_diff: agent.git_diff ?? "",
-        conversation_recent: agent.conversation_recent ?? "",
-        terminal: agent.terminal ?? "",
-        pid: agent.pid ?? 0,
-        last_seen: now,
-        online: 1,
-      };
-      upsertAgentStmt.run(row);
+      const existing = getAgentStmt.get(agent.session_id);
+      if (!existing) {
+        insertAgentStmt.run({
+          session_id: agent.session_id,
+          name: agent.name ?? "",
+          title: agent.title ?? "",
+          agent_type: agent.agent_type ?? "",
+          machine: agent.machine ?? "",
+          cwd: agent.cwd ?? "",
+          cwd_remote: agent.cwd_remote ?? "",
+          branch: agent.branch ?? "",
+          status: agent.status ?? "",
+          dirty_files: agent.dirty_files ?? "[]",
+          background_processes: agent.background_processes ?? "[]",
+          git_diff: agent.git_diff ?? "",
+          conversation_recent: agent.conversation_recent ?? "",
+          terminal: agent.terminal ?? "",
+          pid: agent.pid ?? 0,
+          last_seen: now,
+          online: 1,
+        });
+        return;
+      }
+      // Partial update: only touch fields the caller provided, always refresh liveness
+      const sets: string[] = ["last_seen = @last_seen", "online = 1"];
+      const params: Record<string, unknown> = { session_id: agent.session_id, last_seen: now };
+      for (const field of AGENT_UPDATE_FIELDS) {
+        const value = (agent as Record<string, unknown>)[field];
+        if (value !== undefined) {
+          sets.push(`${field} = @${field}`);
+          params[field] = value;
+        }
+      }
+      db.prepare(`UPDATE agents SET ${sets.join(", ")} WHERE session_id = @session_id`).run(params);
     },
 
     getAgents(room?: string) {
@@ -564,7 +585,8 @@ export function createStore(dbPath?: string): Store {
     purgeOldMessages(maxAgeDays) {
       const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
       const result = purgeOldMessagesStmt.run(cutoff);
-      return result.changes;
+      const roomResult = purgeOldRoomMessagesStmt.run(cutoff);
+      return result.changes + roomResult.changes;
     },
 
     touchAgent(sessionId) {
@@ -748,6 +770,10 @@ export function createStore(dbPath?: string): Store {
         return getRoomMessagesBeforeStmt.all(room, before, limit) as RoomMessage[];
       }
       return getRoomMessagesStmt.all(room, limit) as RoomMessage[];
+    },
+
+    getRecentActivity(limit) {
+      return getRecentActivityStmt.all(limit) as { from_agent: string; to_agent: string; content: string; timestamp: number; room: string | null }[];
     },
 
     // ── Notification prefs methods ──

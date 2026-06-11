@@ -1,60 +1,35 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { mcpUrl } from "./auth.js";
+import { homedir } from "node:os";
+import { copyHookScript } from "./hook.js";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
+const CYAN = "\x1b[36m";
 
-export function setupOpenCode(agentName: string, serverUrl: string): void {
-  const configPath = join(process.cwd(), "opencode.json");
+export function setupOpenCode(_agentName: string, serverUrl: string): void {
+  const hotlineDir = join(homedir(), ".agent-hotline");
 
-  let config: Record<string, unknown> = {};
-  if (existsSync(configPath)) {
-    try {
-      config = JSON.parse(readFileSync(configPath, "utf-8"));
-    } catch {
-      config = {};
-    }
+  copyHookScript();
+  const configDst = join(hotlineDir, "config");
+  if (!existsSync(configDst)) {
+    if (!existsSync(hotlineDir)) mkdirSync(hotlineDir, { recursive: true });
+    writeFileSync(configDst, `HOTLINE_SERVER=${serverUrl}\n`, "utf-8");
   }
 
-  const changes: string[] = [];
-
-  if (!config.mcp || typeof config.mcp !== "object") {
-    config.mcp = {};
-  }
-  const mcp = config.mcp as Record<string, unknown>;
-
-  const desiredMcp = {
-    type: "remote",
-    url: mcpUrl(serverUrl),
-  };
-
-  const existing = mcp["hotline"] as Record<string, unknown> | undefined;
-  if (!existing || existing.url !== desiredMcp.url || existing.type !== desiredMcp.type) {
-    mcp["hotline"] = desiredMcp;
-    changes.push("mcp.hotline");
-  }
-
-  writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
-
-  if (changes.length === 0) {
-    console.log(`${DIM}Already configured - no changes needed.${RESET}`);
-  } else {
-    console.log(`${GREEN}${BOLD}Configured OpenCode${RESET}`);
-    console.log(`${DIM}File: ${configPath}${RESET}`);
-    console.log();
-    for (const c of changes) {
-      console.log(`  ${YELLOW}+${RESET} ${c}`);
-    }
-    console.log();
-    console.log(
-      `${DIM}Agent name "${agentName}" is not embedded in opencode config.${RESET}`,
-    );
-    console.log(
-      `${DIM}Use the agent-hotline MCP tools with your agent name at runtime.${RESET}`,
-    );
-  }
+  console.log(`${GREEN}${BOLD}Setup complete${RESET}`);
+  console.log();
+  console.log(`  Installed hook.sh to ${DIM}~/.agent-hotline/hook.sh${RESET}`);
+  console.log(`  Config at ${DIM}~/.agent-hotline/config${RESET}`);
+  console.log();
+  console.log(`${CYAN}Add the prompt hook to your OpenCode settings:${RESET}`);
+  console.log(`  ${DIM}keybinding or config depending on OpenCode version${RESET}`);
+  console.log();
+  console.log(`${CYAN}Then use the CLI (identity auto-resolved):${RESET}`);
+  console.log(`  agent-hotline who       # who's online`);
+  console.log(`  agent-hotline check     # read inbox`);
+  console.log(`  agent-hotline send <agent> "hello"`);
+  console.log();
 }

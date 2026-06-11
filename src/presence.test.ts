@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { hostname } from "node:os";
 import { startPresenceLoop } from "./presence.js";
 import type { Store } from "./store.js";
 import type { Agent } from "./store.js";
 
-function makeAgent(name: string, lastSeen: number): Agent {
+const HOUR = 60 * 60 * 1000;
+
+function makeAgent(name: string, lastSeen: number, extra?: Partial<Agent>): Agent {
   return {
     session_id: name,
     agent_type: "",
@@ -17,7 +20,8 @@ function makeAgent(name: string, lastSeen: number): Agent {
     conversation_recent: "",
     last_seen: lastSeen,
     online: 1,
-  };
+    ...extra,
+  } as Agent;
 }
 
 function mockStore(agents: Agent[]): Store {
@@ -31,7 +35,7 @@ function mockStore(agents: Agent[]): Store {
     markRead: vi.fn(),
     markOffline: vi.fn(),
     getOnlineAgents: vi.fn(() => agents),
-  };
+  } as unknown as Store;
 }
 
 describe("startPresenceLoop", () => {
@@ -45,7 +49,7 @@ describe("startPresenceLoop", () => {
 
   it("marks stale agents offline after interval fires", () => {
     const now = Date.now();
-    const staleAgent = makeAgent("stale", now - 3 * 60 * 1000); // 3 min ago
+    const staleAgent = makeAgent("stale", now - 2 * HOUR);
     const freshAgent = makeAgent("fresh", now - 30 * 1000); // 30s ago
     const store = mockStore([staleAgent, freshAgent]);
 
@@ -90,7 +94,7 @@ describe("startPresenceLoop", () => {
 
   it("runs repeatedly on each interval tick", () => {
     const now = Date.now();
-    const store = mockStore([makeAgent("old", now - 5 * 60 * 1000)]);
+    const store = mockStore([makeAgent("old", now - 2 * HOUR)]);
 
     const loop = startPresenceLoop(store, 1000);
 
@@ -103,7 +107,7 @@ describe("startPresenceLoop", () => {
 
   it("stop() prevents further checks", () => {
     const now = Date.now();
-    const store = mockStore([makeAgent("old", now - 5 * 60 * 1000)]);
+    const store = mockStore([makeAgent("old", now - 2 * HOUR)]);
 
     const loop = startPresenceLoop(store, 1000);
 
@@ -118,7 +122,7 @@ describe("startPresenceLoop", () => {
 
   it("uses default interval of 30 seconds", () => {
     const now = Date.now();
-    const store = mockStore([makeAgent("old", now - 5 * 60 * 1000)]);
+    const store = mockStore([makeAgent("old", now - 2 * HOUR)]);
 
     const loop = startPresenceLoop(store);
 
@@ -131,12 +135,10 @@ describe("startPresenceLoop", () => {
     loop.stop();
   });
 
-  it("uses 2-minute threshold for staleness", () => {
+  it("uses 1-hour threshold for remote agent staleness", () => {
     const now = Date.now();
-    // Agent seen 1m59s ago - should NOT be marked offline even after 1s interval
-    const fresh = makeAgent("fresh", now - 119_000 + 1000);
-    // Agent seen 2m01s ago - should be marked offline
-    const stale = makeAgent("stale", now - 121_000 - 1000);
+    const fresh = makeAgent("fresh", now - HOUR + 60_000); // 59 min ago
+    const stale = makeAgent("stale", now - HOUR - 60_000); // 61 min ago
     const store = mockStore([fresh, stale]);
 
     const loop = startPresenceLoop(store, 1000);
@@ -144,6 +146,22 @@ describe("startPresenceLoop", () => {
 
     expect(store.markOffline).toHaveBeenCalledTimes(1);
     expect(store.markOffline).toHaveBeenCalledWith("stale");
+
+    loop.stop();
+  });
+
+  it("marks local agents offline immediately when their PID is dead", () => {
+    const now = Date.now();
+    // Fresh heartbeat, but the process is gone — PID check wins over the time threshold
+    const deadPid = makeAgent("dead-pid", now, { pid: 999_999_999, machine: hostname() });
+    const alivePid = makeAgent("alive-pid", now, { pid: process.pid, machine: hostname() });
+    const store = mockStore([deadPid, alivePid]);
+
+    const loop = startPresenceLoop(store, 1000);
+    vi.advanceTimersByTime(1000);
+
+    expect(store.markOffline).toHaveBeenCalledTimes(1);
+    expect(store.markOffline).toHaveBeenCalledWith("dead-pid");
 
     loop.stop();
   });

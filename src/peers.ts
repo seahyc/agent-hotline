@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Store, Peer } from "./store.js";
 import { getNodeId, tick, mergeClock, getClock } from "./node.js";
 import { log } from "./log.js";
+import { notifySseClients } from "./sse.js";
 
 const GOSSIP_INTERVAL_MS = 20_000; // 20s
 const SUSPECT_THRESHOLD = 3; // missed rounds before suspect
@@ -115,7 +116,9 @@ export function mergeGossip(store: Store, payload: GossipPayload, localNodeId: s
         const agentRecord = store.getAgent(localAgent.session_id);
         const originNode = (agentRecord as any)?.origin_node;
         if (!originNode || originNode === "" || originNode === localNodeId) {
-          store.createMessage(msg.from, localAgent.session_id, msg.content);
+          const id = store.createMessage(msg.from, localAgent.session_id, msg.content);
+          const delivered = store.getMessage(id);
+          if (delivered) notifySseClients(localAgent.session_id, delivered);
           log("info", `mesh: relay-gossip delivery ${msg.from} -> ${localAgent.session_id}`);
         }
       }
@@ -214,6 +217,90 @@ export function startGossipLoop(
   return {
     stop() {
       clearInterval(timer);
+    },
+  };
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Long-poll bootstrap relays for store-and-forward messages addressed to our
+ * local agents. The relay holds each request ~20s and answers the moment a
+ * message arrives — near-instant cross-machine delivery for NAT'd nodes,
+ * instead of waiting for the next 20s gossip round. Falls back silently when
+ * the relay doesn't support /api/poll yet.
+ */
+export function startRelayPoll(
+  store: Store,
+  opts: { clusterKey: string; bootstrapUrls: string[] },
+): { stop: () => void } {
+  let running = true;
+  const localNodeId = getNodeId();
+
+  const pollLoop = async (relayUrl: string) => {
+    let unsupportedUntil = 0;
+    while (running) {
+      try {
+        if (Date.now() < unsupportedUntil) {
+          await sleep(10_000);
+          continue;
+        }
+        const agents = store.getOnlineAgents()
+          .filter((a) => {
+            const origin = (a as any).origin_node;
+            return !origin || origin === "" || origin === localNodeId;
+          })
+          .map((a) => a.session_id);
+        if (agents.length === 0) {
+          await sleep(5_000);
+          continue;
+        }
+
+        const res = await fetch(`${relayUrl}/api/poll`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${opts.clusterKey}`,
+          },
+          body: JSON.stringify({ nodeId: localNodeId, agents }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (res.status === 404) {
+          // Relay not upgraded yet — re-check every 10 minutes, gossip still delivers
+          log("info", `relay ${relayUrl} has no /api/poll, falling back to gossip delivery`);
+          unsupportedUntil = Date.now() + 10 * 60 * 1000;
+          continue;
+        }
+        if (!res.ok) {
+          await sleep(5_000);
+          continue;
+        }
+        const { messages } = (await res.json()) as { messages?: { globalId: string; from: string; to: string; content: string }[] };
+        for (const msg of messages ?? []) {
+          if (store.hasSeenMessage(msg.globalId)) continue;
+          store.markMessageSeen(msg.globalId);
+          const localAgent = store.resolveAgent(msg.to);
+          if (localAgent) {
+            const id = store.createMessage(msg.from, localAgent.session_id, msg.content);
+            const delivered = store.getMessage(id);
+            if (delivered) notifySseClients(localAgent.session_id, delivered);
+            log("info", `mesh: long-poll delivery ${msg.from} -> ${localAgent.session_id}`);
+          }
+        }
+        // Got messages or clean timeout — re-poll immediately
+      } catch {
+        await sleep(5_000);
+      }
+    }
+  };
+
+  for (const url of opts.bootstrapUrls) {
+    void pollLoop(url);
+  }
+
+  return {
+    stop() {
+      running = false;
     },
   };
 }

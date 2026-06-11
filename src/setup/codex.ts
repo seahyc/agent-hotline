@@ -1,55 +1,36 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { mcpUrl } from "./auth.js";
+import { copyHookScript } from "./hook.js";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
+const CYAN = "\x1b[36m";
 
-export function setupCodex(agentName: string, serverUrl: string): void {
-  const dir = join(homedir(), ".codex");
-  const configPath = join(dir, "config.toml");
+export function setupCodex(_agentName: string, serverUrl: string): void {
+  const hotlineDir = join(homedir(), ".agent-hotline");
 
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  copyHookScript();
+  const configDst = join(hotlineDir, "config");
+  if (!existsSync(configDst)) {
+    if (!existsSync(hotlineDir)) mkdirSync(hotlineDir, { recursive: true });
+    writeFileSync(configDst, `HOTLINE_SERVER=${serverUrl}\n`, "utf-8");
   }
 
-  let content = "";
-  if (existsSync(configPath)) {
-    content = readFileSync(configPath, "utf-8");
-  }
-
-  // Check if already configured
-  if (content.includes("[mcp_servers.hotline]")) {
-    console.log(`${DIM}Already configured - no changes needed.${RESET}`);
-    console.log(`${DIM}File: ${configPath}${RESET}`);
-    return;
-  }
-
-  const block = [
-    "",
-    "[mcp_servers.hotline]",
-    'type = "url"',
-    `url = "${mcpUrl(serverUrl)}"`,
-    "",
-  ].join("\n");
-
-  content = content.trimEnd() + "\n" + block;
-
-  writeFileSync(configPath, content, "utf-8");
-
-  console.log(`${GREEN}${BOLD}Configured Codex${RESET}`);
-  console.log(`${DIM}File: ${configPath}${RESET}`);
+  console.log(`${GREEN}${BOLD}Setup complete${RESET}`);
   console.log();
-  console.log(`  ${YELLOW}+${RESET} mcp_servers.hotline`);
+  console.log(`  Installed hook.sh to ${DIM}~/.agent-hotline/hook.sh${RESET}`);
+  console.log(`  Config at ${DIM}~/.agent-hotline/config${RESET}`);
   console.log();
-  console.log(
-    `${DIM}Agent name "${agentName}" is not embedded in codex config.${RESET}`,
-  );
-  console.log(
-    `${DIM}Use the agent-hotline MCP tools with your agent name at runtime.${RESET}`,
-  );
+  console.log(`${CYAN}Codex has no session hooks — agents are auto-discovered by the server's`);
+  console.log(`process scanner (within ~30s of starting) and named after their folder.${RESET}`);
+  console.log();
+  console.log(`${CYAN}Use the CLI (identity auto-resolved):${RESET}`);
+  console.log(`  agent-hotline status    # server + identity + inbox`);
+  console.log(`  agent-hotline who       # who's online`);
+  console.log(`  agent-hotline send <agent> "hello"`);
+  console.log(`  agent-hotline wait      # run in background; exits when a message arrives`);
+  console.log();
 }

@@ -2,6 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { Store } from "./store.js";
 import { getNodeId } from "./node.js";
 import { log } from "./log.js";
+import { notifySseClients } from "./sse.js";
+
+/** Create a message locally and push it to any live SSE listeners. */
+function deliverLocal(store: Store, from: string, to: string, content: string): void {
+  const id = store.createMessage(from, to, content);
+  const msg = store.getMessage(id);
+  if (msg) notifySseClients(to, msg);
+}
 
 const MAX_TTL = 3;
 
@@ -73,7 +81,7 @@ export function createMeshRouter(store: Store, opts: { clusterKey: string }): Me
         const agentRecord = store.getAgent(localAgent.session_id);
         const originNode = (agentRecord as any)?.origin_node;
         if (!originNode || originNode === "" || originNode === localNodeId) {
-          store.createMessage(from, localAgent.session_id, content);
+          deliverLocal(store, from, localAgent.session_id, content);
           store.markMessageSeen(globalId);
           log("info", `mesh: local delivery ${from} -> ${localAgent.session_id}`);
           return { delivered: true, target: localAgent.session_id, method: "local" };
@@ -128,7 +136,7 @@ export function createMeshRouter(store: Store, opts: { clusterKey: string }): Me
         const agentRecord = store.getAgent(localAgent.session_id);
         const originNode = (agentRecord as any)?.origin_node;
         if (!originNode || originNode === "" || originNode === localNodeId) {
-          store.createMessage(msg.from, localAgent.session_id, msg.content);
+          deliverLocal(store, msg.from, localAgent.session_id, msg.content);
           log("info", `mesh: received relay, local delivery ${msg.from} -> ${localAgent.session_id}`);
           return true;
         }
