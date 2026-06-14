@@ -19,6 +19,7 @@ export interface Agent {
   pid: number;
   last_seen: number; // unix ms
   online: number; // 0 or 1
+  dir_chain: string[]; // ordered directory-room keys (leaf -> ceiling)
 }
 
 export interface Message {
@@ -33,7 +34,7 @@ export interface Message {
   room: string | null;
   reply_to_id: number | null;
   mentions_json: string; // JSON array of session_ids
-  msg_type: string; // "direct" | "room" | "mention" | "reply_notify"
+  msg_type: string; // "direct" | "room" | "mention" | "reply_notify" | "broadcast"
 }
 
 export interface Peer {
@@ -76,6 +77,10 @@ export interface Store {
   getOnlineAgents(): Agent[];
   getSubscribers(event: EventType): string[];
   purgeOldMessages(maxAgeDays: number): number;
+  purgeStaleAgents(maxAgeMs: number): number;
+  purgeOrphanRoomMembers(): number;
+  reconcileAutoRooms(sessionId: string): void;
+  reconcileAllAutoRooms(): void;
   touchAgent(sessionId: string): void;
   addApiKey(key: string, label: string): void;
   createApiKey(label: string): string;
@@ -102,10 +107,9 @@ export interface Store {
   upsertRemoteAgent(agent: Partial<Agent> & { session_id: string }, originNodeId: string): void;
   // Rooms
   createRoom(name: string): void;
-  joinRoom(roomName: string, sessionId: string, notify?: string): void;
+  joinRoom(roomName: string, sessionId: string, source?: "manual" | "auto"): void;
   leaveRoom(roomName: string, sessionId: string): void;
   getRoomMembers(roomName: string): string[];
-  getRoomMemberNotify(roomName: string, sessionId: string): string;
   getAgentRooms(sessionId: string): string[];
   listRooms(): { name: string; memberCount: number }[];
   getRoomsSnapshot(): { name: string; members: string[] }[];
@@ -117,9 +121,6 @@ export interface Store {
   getRoomMessages(room: string, limit: number, before?: number): RoomMessage[];
   /** Latest direct + room messages interleaved, newest first (for the web UI firehose). */
   getRecentActivity(limit: number): { from_agent: string; to_agent: string; content: string; timestamp: number; room: string | null }[];
-  // Notification preferences
-  setNotifyPref(sessionId: string, roomName: string | null, level: string): void;
-  resolveNotifyLevel(sessionId: string, roomName: string): string;
 }
 
 const CREATE_AGENTS = `
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS agents (
   terminal TEXT DEFAULT '',
   pid INTEGER DEFAULT 0,
   last_seen INTEGER DEFAULT 0,
-  online INTEGER DEFAULT 0
+  online INTEGER DEFAULT 0,
+  dir_chain TEXT DEFAULT '[]'
 )`;
 
 const CREATE_MESSAGES = `
@@ -200,6 +202,22 @@ CREATE TABLE IF NOT EXISTS seen_message_ids (
   expires_at INTEGER NOT NULL
 )`;
 
+/** Parse the dir_chain JSON column back into a string[]; tolerate bad/legacy data. */
+function hydrateAgent<T extends { dir_chain?: unknown }>(row: T | undefined): (T & { dir_chain: string[] }) | null {
+  if (!row) return null;
+  let chain: string[] = [];
+  const raw = (row as { dir_chain?: unknown }).dir_chain;
+  if (typeof raw === "string" && raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) chain = parsed.filter((x): x is string => typeof x === "string");
+    } catch { /* leave empty */ }
+  } else if (Array.isArray(raw)) {
+    chain = raw.filter((x): x is string => typeof x === "string");
+  }
+  return { ...(row as T), dir_chain: chain };
+}
+
 export function createStore(dbPath?: string): Store {
   const db = new Database(dbPath ?? "./hotline.db");
   db.pragma("journal_mode = WAL");
@@ -240,16 +258,17 @@ export function createStore(dbPath?: string): Store {
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_name, timestamp)`);
 
-  // Notification preferences table
-  db.exec(`CREATE TABLE IF NOT EXISTS notification_prefs (
-    session_id TEXT NOT NULL,
-    room_name  TEXT,
-    level      TEXT NOT NULL DEFAULT 'all',
-    PRIMARY KEY (session_id, room_name)
-  )`);
+  // Drop legacy notification-preferences feature (replaced by fixed notification model).
+  db.exec("DROP TABLE IF EXISTS notify_prefs");
+  db.exec("DROP TABLE IF EXISTS notification_prefs");
 
-  // Migration: add notify column to room_members
+  // Migration: legacy notify column on room_members left in place (unused) for
+  // SQLite drop-column compatibility; new directory-room membership uses `source`.
   try { db.exec("ALTER TABLE room_members ADD COLUMN notify TEXT DEFAULT 'all'"); } catch (_) { /* already exists */ }
+  try { db.exec("ALTER TABLE room_members ADD COLUMN source TEXT DEFAULT 'manual'"); } catch (_) { /* already exists */ }
+
+  // Migration: directory-room chain cached on the agent row.
+  try { db.exec("ALTER TABLE agents ADD COLUMN dir_chain TEXT DEFAULT '[]'"); } catch (_) { /* already exists */ }
 
   // Migrations for message room/reply/mention columns
   try { db.exec("ALTER TABLE messages ADD COLUMN room TEXT DEFAULT NULL"); } catch (_) { /* already exists */ }
@@ -265,12 +284,13 @@ export function createStore(dbPath?: string): Store {
   try { db.exec("ALTER TABLE agents ADD COLUMN title TEXT DEFAULT ''"); } catch (_) { /* already exists */ }
 
   const insertAgentStmt = db.prepare(`
-    INSERT INTO agents (session_id, name, title, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online)
-    VALUES (@session_id, @name, @title, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online)
+    INSERT INTO agents (session_id, name, title, agent_type, machine, cwd, cwd_remote, branch, status, dirty_files, background_processes, git_diff, conversation_recent, terminal, pid, last_seen, online, dir_chain)
+    VALUES (@session_id, @name, @title, @agent_type, @machine, @cwd, @cwd_remote, @branch, @status, @dirty_files, @background_processes, @git_diff, @conversation_recent, @terminal, @pid, @last_seen, @online, @dir_chain)
   `);
 
   // Fields callers may partially update; absent/undefined fields are left untouched
   // (a bare heartbeat upsert must not wipe context resolved earlier).
+  // dir_chain is handled separately (string[] -> JSON).
   const AGENT_UPDATE_FIELDS = [
     "name", "title", "agent_type", "machine", "cwd", "cwd_remote", "branch", "status",
     "dirty_files", "background_processes", "git_diff", "conversation_recent", "terminal", "pid",
@@ -387,10 +407,10 @@ export function createStore(dbPath?: string): Store {
 
   // Room statements
   const createRoomStmt = db.prepare("INSERT OR IGNORE INTO rooms (name, created_at) VALUES (?, ?)");
-  const joinRoomStmt = db.prepare("INSERT INTO room_members (room_name, session_id, joined_at, notify) VALUES (?, ?, ?, ?) ON CONFLICT(room_name, session_id) DO UPDATE SET notify = excluded.notify");
+  const joinRoomStmt = db.prepare("INSERT INTO room_members (room_name, session_id, joined_at, source) VALUES (?, ?, ?, ?) ON CONFLICT(room_name, session_id) DO UPDATE SET source = excluded.source");
   const leaveRoomStmt = db.prepare("DELETE FROM room_members WHERE room_name = ? AND session_id = ?");
   const getRoomMembersStmt = db.prepare("SELECT session_id FROM room_members WHERE room_name = ?");
-  const getRoomMemberNotifyStmt = db.prepare("SELECT notify FROM room_members WHERE room_name = ? AND session_id = ?");
+  const getAgentAutoRoomsStmt = db.prepare("SELECT room_name FROM room_members WHERE session_id = ? AND source = 'auto'");
   const getAgentRoomsStmt = db.prepare("SELECT room_name FROM room_members WHERE session_id = ?");
   const listRoomsStmt = db.prepare("SELECT r.name, COUNT(rm.session_id) as member_count FROM rooms r LEFT JOIN room_members rm ON r.name = rm.room_name GROUP BY r.name");
   const getRoomsSnapshotStmt = db.prepare("SELECT r.name, rm.session_id FROM rooms r LEFT JOIN room_members rm ON r.name = rm.room_name");
@@ -414,15 +434,12 @@ export function createStore(dbPath?: string): Store {
     ORDER BY timestamp DESC LIMIT ?
   `);
 
-  // Notification pref statements
-  const setNotifyPrefStmt = db.prepare(
-    "INSERT INTO notification_prefs (session_id, room_name, level) VALUES (?, ?, ?) ON CONFLICT(session_id, room_name) DO UPDATE SET level = excluded.level"
+  // Purge statements
+  const purgeStaleAgentsStmt = db.prepare(
+    "DELETE FROM agents WHERE online = 0 AND last_seen < ?",
   );
-  const getNotifyPrefStmt = db.prepare(
-    "SELECT level FROM notification_prefs WHERE session_id = ? AND room_name = ?"
-  );
-  const getGlobalNotifyPrefStmt = db.prepare(
-    "SELECT level FROM notification_prefs WHERE session_id = ? AND room_name IS NULL"
+  const purgeOrphanRoomMembersStmt = db.prepare(
+    "DELETE FROM room_members WHERE session_id NOT IN (SELECT session_id FROM agents)",
   );
 
   // Mesh message statements
@@ -495,6 +512,7 @@ export function createStore(dbPath?: string): Store {
           pid: agent.pid ?? 0,
           last_seen: now,
           online: 1,
+          dir_chain: JSON.stringify(agent.dir_chain ?? []),
         });
         return;
       }
@@ -508,35 +526,39 @@ export function createStore(dbPath?: string): Store {
           params[field] = value;
         }
       }
+      // dir_chain stored as JSON; only overwrite when explicitly provided.
+      if (agent.dir_chain !== undefined) {
+        sets.push("dir_chain = @dir_chain");
+        params.dir_chain = JSON.stringify(agent.dir_chain);
+      }
       db.prepare(`UPDATE agents SET ${sets.join(", ")} WHERE session_id = @session_id`).run(params);
     },
 
     getAgents(room?: string) {
-      if (room) {
-        const escaped = room.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
-        return getAgentsByRoomStmt.all(`%${escaped}%`) as Agent[];
-      }
-      return getAgentsStmt.all() as Agent[];
+      const rows = room
+        ? getAgentsByRoomStmt.all(`%${room.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`)
+        : getAgentsStmt.all();
+      return (rows as Agent[]).map((r) => hydrateAgent(r)!);
     },
 
     getAgent(sessionId) {
-      return (getAgentStmt.get(sessionId) as Agent) ?? null;
+      return hydrateAgent(getAgentStmt.get(sessionId) as Agent | undefined);
     },
 
     getAgentByPid(pid) {
       if (!pid) return null;
-      return (getAgentByPidStmt.get(pid) as Agent) ?? null;
+      return hydrateAgent(getAgentByPidStmt.get(pid) as Agent | undefined);
     },
 
     getRecentOnlineAgent() {
-      return (getRecentOnlineAgentStmt.get() as Agent) ?? null;
+      return hydrateAgent(getRecentOnlineAgentStmt.get() as Agent | undefined);
     },
 
     resolveAgent(nameOrId) {
       // Try by name first, then by session_id
-      const byName = (getAgentByNameStmt.get(nameOrId) as Agent) ?? null;
+      const byName = hydrateAgent(getAgentByNameStmt.get(nameOrId) as Agent | undefined);
       if (byName) return byName;
-      return (getAgentStmt.get(nameOrId) as Agent) ?? null;
+      return hydrateAgent(getAgentStmt.get(nameOrId) as Agent | undefined);
     },
 
     renameAgent(sessionId, name) {
@@ -574,7 +596,7 @@ export function createStore(dbPath?: string): Store {
     },
 
     getOnlineAgents() {
-      return getOnlineAgentsStmt.all() as Agent[];
+      return (getOnlineAgentsStmt.all() as Agent[]).map((r) => hydrateAgent(r)!);
     },
 
     getSubscribers(event) {
@@ -587,6 +609,48 @@ export function createStore(dbPath?: string): Store {
       const result = purgeOldMessagesStmt.run(cutoff);
       const roomResult = purgeOldRoomMessagesStmt.run(cutoff);
       return result.changes + roomResult.changes;
+    },
+
+    purgeStaleAgents(maxAgeMs) {
+      const cutoff = Date.now() - maxAgeMs;
+      return purgeStaleAgentsStmt.run(cutoff).changes;
+    },
+
+    purgeOrphanRoomMembers() {
+      return purgeOrphanRoomMembersStmt.run().changes;
+    },
+
+    reconcileAutoRooms(sessionId) {
+      const self = hydrateAgent(getAgentStmt.get(sessionId) as Agent | undefined);
+      if (!self) return;
+      const online = (getOnlineAgentsStmt.all() as Agent[]).map((r) => hydrateAgent(r)!);
+      // Count how many online agents have each chain entry.
+      const counts = new Map<string, number>();
+      for (const a of online) {
+        for (const key of new Set(a.dir_chain)) {
+          counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+      }
+      // Desired auto-rooms: entries in this agent's chain shared by >=2 online agents.
+      const desired = new Set<string>();
+      for (const key of new Set(self.dir_chain)) {
+        if ((counts.get(key) ?? 0) >= 2) desired.add(key);
+      }
+      const current = new Set(
+        (getAgentAutoRoomsStmt.all(sessionId) as { room_name: string }[]).map((r) => r.room_name),
+      );
+      // Join missing, leave stale. Manual memberships are never touched.
+      for (const room of desired) {
+        if (!current.has(room)) this.joinRoom(room, sessionId, "auto");
+      }
+      for (const room of current) {
+        if (!desired.has(room)) this.leaveRoom(room, sessionId);
+      }
+    },
+
+    reconcileAllAutoRooms() {
+      const online = getOnlineAgentsStmt.all() as Agent[];
+      for (const a of online) this.reconcileAutoRooms(a.session_id);
     },
 
     touchAgent(sessionId) {
@@ -706,9 +770,9 @@ export function createStore(dbPath?: string): Store {
       createRoomStmt.run(name, Date.now());
     },
 
-    joinRoom(roomName, sessionId, notify = "all") {
+    joinRoom(roomName, sessionId, source = "manual") {
       createRoomStmt.run(roomName, Date.now()); // ensure room exists
-      joinRoomStmt.run(roomName, sessionId, Date.now(), notify);
+      joinRoomStmt.run(roomName, sessionId, Date.now(), source);
     },
 
     leaveRoom(roomName, sessionId) {
@@ -718,11 +782,6 @@ export function createStore(dbPath?: string): Store {
     getRoomMembers(roomName) {
       const rows = getRoomMembersStmt.all(roomName) as { session_id: string }[];
       return rows.map((r) => r.session_id);
-    },
-
-    getRoomMemberNotify(roomName, sessionId) {
-      const row = getRoomMemberNotifyStmt.get(roomName, sessionId) as { notify: string } | undefined;
-      return row?.notify ?? "all";
     },
 
     getAgentRooms(sessionId) {
@@ -749,7 +808,7 @@ export function createStore(dbPath?: string): Store {
       for (const room of rooms) {
         createRoomStmt.run(room.name, Date.now());
         for (const member of room.members) {
-          joinRoomStmt.run(room.name, member, Date.now(), 1);
+          joinRoomStmt.run(room.name, member, Date.now(), "manual");
         }
       }
     },
@@ -774,21 +833,6 @@ export function createStore(dbPath?: string): Store {
 
     getRecentActivity(limit) {
       return getRecentActivityStmt.all(limit) as { from_agent: string; to_agent: string; content: string; timestamp: number; room: string | null }[];
-    },
-
-    // ── Notification prefs methods ──
-
-    setNotifyPref(sessionId, roomName, level) {
-      setNotifyPrefStmt.run(sessionId, roomName, level);
-    },
-
-    resolveNotifyLevel(sessionId, roomName) {
-      // per-room pref → global pref → "all"
-      const roomPref = getNotifyPrefStmt.get(sessionId, roomName) as { level: string } | undefined;
-      if (roomPref) return roomPref.level;
-      const globalPref = getGlobalNotifyPrefStmt.get(sessionId) as { level: string } | undefined;
-      if (globalPref) return globalPref.level;
-      return "all";
     },
 
     upsertRemoteAgent(agent, originNodeId) {

@@ -165,4 +165,134 @@ describe("store", () => {
       expect(store.getAgent("alice")!.online).toBe(1);
     });
   });
+
+  describe("dir_chain", () => {
+    it("defaults to empty array and round-trips a provided chain", () => {
+      store.upsertAgent({ session_id: "alice" });
+      expect(store.getAgent("alice")!.dir_chain).toEqual([]);
+
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo/src", "repo"] });
+      expect(store.getAgent("alice")!.dir_chain).toEqual(["repo/src", "repo"]);
+    });
+
+    it("does not wipe dir_chain on a bare heartbeat upsert", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo"] });
+      store.upsertAgent({ session_id: "alice", status: "busy" });
+      expect(store.getAgent("alice")!.dir_chain).toEqual(["repo"]);
+    });
+  });
+
+  describe("purgeStaleAgents", () => {
+    it("deletes offline agents past the window, keeps online ones", () => {
+      store.upsertAgent({ session_id: "online-agent" });
+      store.upsertAgent({ session_id: "offline-a" });
+      store.upsertAgent({ session_id: "offline-b" });
+      store.markOffline("offline-a");
+      store.markOffline("offline-b");
+
+      // Negative maxAgeMs => cutoff is in the future => every offline row qualifies.
+      const removed = store.purgeStaleAgents(-1000);
+      expect(removed).toBe(2);
+      expect(store.getAgent("online-agent")).not.toBeNull();
+      expect(store.getAgent("offline-a")).toBeNull();
+      expect(store.getAgent("offline-b")).toBeNull();
+    });
+
+    it("does not delete recently-seen offline agents with a real window", () => {
+      store.upsertAgent({ session_id: "bob" });
+      store.markOffline("bob");
+      const removed = store.purgeStaleAgents(24 * 60 * 60 * 1000); // 24h window
+      expect(removed).toBe(0);
+      expect(store.getAgent("bob")).not.toBeNull();
+    });
+  });
+
+  describe("purgeOrphanRoomMembers", () => {
+    it("removes room_members whose session has no agent row", () => {
+      store.upsertAgent({ session_id: "alice" });
+      store.joinRoom("proj", "alice");
+      store.joinRoom("proj", "ghost-session"); // no agent row
+      expect(store.getRoomMembers("proj").sort()).toEqual(["alice", "ghost-session"]);
+
+      const removed = store.purgeOrphanRoomMembers();
+      expect(removed).toBe(1);
+      expect(store.getRoomMembers("proj")).toEqual(["alice"]);
+    });
+  });
+
+  describe("reconcileAutoRooms", () => {
+    it("joins a room for a chain key shared by >=2 online agents", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo/src", "repo"] });
+      store.upsertAgent({ session_id: "bob", dir_chain: ["repo/test", "repo"] });
+
+      store.reconcileAutoRooms("alice");
+      store.reconcileAutoRooms("bob");
+
+      // Both share "repo" (repo root) -> auto-joined; subdirs are single-occupant -> no room.
+      expect(store.getAgentRooms("alice")).toEqual(["repo"]);
+      expect(store.getAgentRooms("bob")).toEqual(["repo"]);
+      expect(store.getRoomMembers("repo").sort()).toEqual(["alice", "bob"]);
+    });
+
+    it("does not create a room for a single-occupant chain key", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["solo/src", "solo"] });
+      store.upsertAgent({ session_id: "bob", dir_chain: ["other", "other"] });
+
+      store.reconcileAutoRooms("alice");
+      expect(store.getAgentRooms("alice")).toEqual([]);
+    });
+
+    it("joins the deepest shared key when two agents share a subdir", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo/src", "repo"] });
+      store.upsertAgent({ session_id: "bob", dir_chain: ["repo/src", "repo"] });
+
+      store.reconcileAutoRooms("alice");
+      store.reconcileAutoRooms("bob");
+
+      // Both "repo/src" and "repo" are shared -> member of both auto-rooms.
+      expect(store.getAgentRooms("alice").sort()).toEqual(["repo", "repo/src"]);
+      expect(store.getAgentRooms("bob").sort()).toEqual(["repo", "repo/src"]);
+    });
+
+    it("leaves stale auto rooms when the chain changes", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo/src", "repo"] });
+      store.upsertAgent({ session_id: "bob", dir_chain: ["repo/src", "repo"] });
+      store.reconcileAutoRooms("alice");
+      store.reconcileAutoRooms("bob");
+      expect(store.getAgentRooms("alice").sort()).toEqual(["repo", "repo/src"]);
+
+      // Alice moves to a different subdir; "repo/src" no longer shared with her.
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo/docs", "repo"] });
+      store.reconcileAutoRooms("alice");
+
+      // "repo" still shared (both in repo); "repo/src" left (she's no longer there).
+      expect(store.getAgentRooms("alice")).toEqual(["repo"]);
+      expect(store.getRoomMembers("repo/src")).toEqual(["bob"]);
+    });
+
+    it("never touches manual memberships", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo/src", "repo"] });
+      store.upsertAgent({ session_id: "bob", dir_chain: ["repo/src", "repo"] });
+      store.joinRoom("hand-picked", "alice"); // manual
+
+      store.reconcileAutoRooms("alice");
+
+      const rooms = store.getAgentRooms("alice").sort();
+      expect(rooms).toContain("hand-picked");
+      expect(rooms).toContain("repo");
+      expect(rooms).toContain("repo/src");
+
+      // Moving away from the repo leaves auto rooms but keeps the manual one.
+      store.upsertAgent({ session_id: "alice", dir_chain: ["elsewhere"] });
+      store.reconcileAutoRooms("alice");
+      expect(store.getAgentRooms("alice")).toEqual(["hand-picked"]);
+    });
+
+    it("reconcileAllAutoRooms reconciles every online agent", () => {
+      store.upsertAgent({ session_id: "alice", dir_chain: ["repo", "repo"] });
+      store.upsertAgent({ session_id: "bob", dir_chain: ["repo", "repo"] });
+      store.reconcileAllAutoRooms();
+      expect(store.getRoomMembers("repo").sort()).toEqual(["alice", "bob"]);
+    });
+  });
 });

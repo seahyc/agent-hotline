@@ -1,6 +1,7 @@
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { hostname, platform } from "node:os";
+import { basename, dirname, relative, isAbsolute } from "node:path";
 import { log } from "./log.js";
 
 const execAsync = promisify(execCb);
@@ -14,6 +15,7 @@ export interface AgentContext {
   agent_type: string;
   conversation_recent: string;
   background_processes: { pid: number; command: string }[];
+  dir_chain: string[];
 }
 
 interface CacheEntry {
@@ -85,6 +87,56 @@ async function getGitRemote(cwd: string): Promise<string> {
   return run(`git -C "${cwd}" remote get-url origin 2>/dev/null`);
 }
 
+/** Keys for `startDir`, its ancestors, up to and including `root` (a repo root with
+ * basename `base`). Root itself keys as `base`; nested dirs as `base/<relpath>`.
+ * Leaf-first order. If `startDir` is not within `root`, returns just `[base]`. */
+function keysFromDirToRoot(startDir: string, root: string, base: string): string[] {
+  const rel0 = relative(root, startDir);
+  if (rel0.startsWith("..") || isAbsolute(rel0)) return [base];
+  const keys: string[] = [];
+  let d = startDir;
+  // Bounded climb: relative() shrinks to "" exactly at root, terminating the loop.
+  for (let i = 0; i < 256; i++) {
+    const rel = relative(root, d);
+    keys.push(rel === "" ? base : `${base}/${rel}`);
+    if (rel === "") break;
+    d = dirname(d);
+  }
+  return keys;
+}
+
+/**
+ * Compute the directory-room key chain for a cwd, leaf -> ceiling.
+ * - Not in a git repo: `[cwd]` only (machine-local key; no ancestor climb).
+ * - In a repo: cwd + each ancestor up to the repo root, keyed `<repoBasename>/<relpath>`
+ *   (repo root itself = `<repoBasename>`).
+ * - Then across submodule boundaries: the repo's superproject (if any) contributes its
+ *   own chain (superproject basename + the submodule's path within it, up to its root),
+ *   repeated until there is no superproject. Outermost superproject root is the ceiling.
+ * All git calls tolerate failure (2s timeout in `run`); on no-repo we fall back to `[cwd]`.
+ */
+export async function computeDirChain(cwd: string): Promise<string[]> {
+  if (!cwd) return [];
+  const top = await run(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`);
+  if (!top) return [cwd]; // no repo boundary; machine-local, no ancestor climb
+
+  const chain: string[] = [];
+  let startDir = cwd;
+  let root = top;
+  for (let depth = 0; depth < 64; depth++) {
+    chain.push(...keysFromDirToRoot(startDir, root, basename(root)));
+    const superRoot = await run(
+      `git -C "${root}" rev-parse --show-superproject-working-tree 2>/dev/null`,
+    );
+    if (!superRoot) break;
+    // This repo is a submodule sitting at `root` within the superproject.
+    startDir = root;
+    root = superRoot;
+  }
+  // Dedupe while preserving leaf-first order (defensive against odd nesting).
+  return [...new Set(chain)];
+}
+
 /** Get child processes of a PID. */
 async function getChildProcesses(pid: number): Promise<{ pid: number; command: string }[]> {
   const childPids = await run(`pgrep -P ${pid} 2>/dev/null`);
@@ -106,11 +158,12 @@ async function getChildProcesses(pid: number): Promise<{ pid: number; command: s
  * different session when sessions share an app process).
  */
 export async function resolveContextForCwd(cwd: string, pid: number): Promise<AgentContext> {
-  const [agent_type, branch, dirty_files, cwd_remote] = await Promise.all([
+  const [agent_type, branch, dirty_files, cwd_remote, dir_chain] = await Promise.all([
     getAgentType(pid),
     getGitBranch(cwd),
     getGitDirtyFiles(cwd),
     getGitRemote(cwd),
+    computeDirChain(cwd),
   ]);
   return {
     cwd,
@@ -121,6 +174,7 @@ export async function resolveContextForCwd(cwd: string, pid: number): Promise<Ag
     agent_type,
     conversation_recent: "",
     background_processes: [],
+    dir_chain,
   };
 }
 
@@ -135,11 +189,12 @@ export async function resolveContext(pid: number, sessionId: string): Promise<Ag
   }
 
   const [cwd, agent_type] = await Promise.all([getCwd(pid), getAgentType(pid)]);
-  const [branch, dirty_files, cwd_remote, background_processes] = await Promise.all([
+  const [branch, dirty_files, cwd_remote, background_processes, dir_chain] = await Promise.all([
     getGitBranch(cwd),
     getGitDirtyFiles(cwd),
     getGitRemote(cwd),
     getChildProcesses(pid),
+    computeDirChain(cwd),
   ]);
 
   const context: AgentContext = {
@@ -151,6 +206,7 @@ export async function resolveContext(pid: number, sessionId: string): Promise<Ag
     agent_type,
     conversation_recent: "",
     background_processes,
+    dir_chain,
   };
 
   cache.set(pid, { context, timestamp: Date.now() });
