@@ -382,9 +382,12 @@ export function createServer(store: Store, opts?: {
             dir_chain: ctx.dir_chain,
           });
           autoNameAgent(store, body.session_id, title, ctx.cwd);
-          // Now that this agent's directory chain is fresh, (re)compute its
-          // automatic project-room memberships against the live cohort.
-          store.reconcileAutoRooms(body.session_id);
+          // This agent's directory chain just changed, which can cross (or drop
+          // below) the >=2-sharer threshold for its whole cohort — e.g. it's the
+          // second agent to enter a repo, so the first must join too. Reconcile
+          // all online agents so project rooms converge immediately rather than
+          // waiting for the next presence sweep.
+          store.reconcileAllAutoRooms();
         })
         .catch((e) => log("warn", `context refresh failed for ${body.session_id}: ${e}`));
     }

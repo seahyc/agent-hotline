@@ -148,9 +148,11 @@ Repo-name + relative-path keys let the same project on two machines merge via go
 - Add `room_members.source` column (`'manual'` default, `'auto'` for directory-rooms).
 - `reconcileAutoRooms(sessionId, desiredRooms[])`: diff desired vs current `source='auto'`
   rows; join missing, leave stale. **Manual memberships are never touched.**
-- Triggered (a) right after an agent's `dir_chain` is (re)resolved on heartbeat, and (b)
-  in the presence-loop tick (every 30s) over the online set, so moves/departures reflect
-  promptly and idempotently.
+- Triggered (a) right after an agent's `dir_chain` is (re)resolved on heartbeat —
+  reconciling the *whole online cohort* (`reconcileAllAutoRooms`), since a new arrival can
+  cross the ≥2 threshold for agents already present, so they must converge immediately
+  rather than waiting for the sweep — and (b) in the presence-loop tick (every 30s) as a
+  backstop for departures. Both are idempotent.
 
 ### Why this is quiet by construction
 With the fixed room model (Change 3), auto-rooms need no notify default: posting to a
