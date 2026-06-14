@@ -379,8 +379,12 @@ export function createServer(store: Store, opts?: {
             cwd: ctx.cwd,
             cwd_remote: ctx.cwd_remote,
             branch: ctx.branch,
+            dir_chain: ctx.dir_chain,
           });
           autoNameAgent(store, body.session_id, title, ctx.cwd);
+          // Now that this agent's directory chain is fresh, (re)compute its
+          // automatic project-room memberships against the live cohort.
+          store.reconcileAutoRooms(body.session_id);
         })
         .catch((e) => log("warn", `context refresh failed for ${body.session_id}: ${e}`));
     }
@@ -462,57 +466,47 @@ export function createServer(store: Store, opts?: {
     const resolvedFrom = store.resolveAgent(from)?.session_id ?? from;
     const mentionedIds = extractMentions(content, store);
 
-    // Room message
+    // Room message — quiet by construction: always recorded in history, but only
+    // @mentioned agents get an inbox push. Non-mention chatter is pull-based
+    // (read --room). Sender auto-joins so they show up as a member.
     if (to.startsWith("#")) {
       const roomName = to.slice(1);
       store.joinRoom(roomName, resolvedFrom);
       store.createRoomMessage(resolvedFrom, roomName, content, { mentionsJson: JSON.stringify(mentionedIds) });
-      const members = store.getRoomMembers(roomName);
-      const recipientSet = new Set(members);
-      let count = 0;
-      for (const member of members) {
-        if (member !== resolvedFrom) {
-          const level = store.resolveNotifyLevel(member, roomName);
-          const isMentioned = mentionedIds.includes(member);
-          if (level === "all" || (level === "mentions" && isMentioned)) {
-            const rmId = store.createMessage(resolvedFrom, member, content, {
-              room: roomName, msgType: "room", mentionsJson: JSON.stringify(mentionedIds),
-            });
-            const rmMsg = store.getMessage(rmId);
-            if (rmMsg) notifySseClients(member, rmMsg);
-            count++;
-          }
-        }
-      }
+      const pinged = new Set<string>();
       for (const mid of mentionedIds) {
-        if (mid !== resolvedFrom && !recipientSet.has(mid)) {
-          const mentionId = store.createMessage(resolvedFrom, mid, content, { msgType: "mention", mentionsJson: JSON.stringify(mentionedIds) });
+        if (mid !== resolvedFrom && !pinged.has(mid)) {
+          pinged.add(mid);
+          const mentionId = store.createMessage(resolvedFrom, mid, content, {
+            room: roomName, msgType: "mention", mentionsJson: JSON.stringify(mentionedIds),
+          });
           const mentionMsg = store.getMessage(mentionId);
           if (mentionMsg) notifySseClients(mid, mentionMsg);
         }
       }
-      log("info", `room message from ${resolvedFrom} to #${roomName} (${count} notified)`);
-      res.json({ ok: true, room: roomName, notified: count });
+      log("info", `room message from ${resolvedFrom} to #${roomName} (${pinged.size} pinged)`);
+      res.json({ ok: true, room: roomName, notified: pinged.size });
       return;
     }
 
-    // Broadcast
+    // Broadcast — deliberate machine-wide blast, opt-in via --all/--force.
     if (to === "*") {
       const agents = store.getOnlineAgents();
-      let count = 0;
-      for (const a of agents) {
-        if (a.session_id !== resolvedFrom) {
-          if (meshRouter) {
-            await meshRouter.route(resolvedFrom, a.session_id, content);
-          } else {
-            const bcId = store.createMessage(resolvedFrom, a.session_id, content);
-            const bcMsg = store.getMessage(bcId);
-            if (bcMsg) notifySseClients(a.session_id, bcMsg);
-          }
-          count++;
-        }
+      const recipients = agents.filter(a => a.session_id !== resolvedFrom);
+      if (!body.force) {
+        res.status(400).json({
+          error: `Broadcast to ${recipients.length} agents needs --all. Use a #room or DM for targeted messages.`,
+        });
+        return;
       }
-      log("info", `message broadcast from ${resolvedFrom} to ${count} agents`);
+      let count = 0;
+      for (const a of recipients) {
+        const bcId = store.createMessage(resolvedFrom, a.session_id, content, { msgType: "broadcast" });
+        const bcMsg = store.getMessage(bcId);
+        if (bcMsg) notifySseClients(a.session_id, bcMsg);
+        count++;
+      }
+      log("info", `forced broadcast from ${resolvedFrom} to ${count} agents`);
       res.json({ ok: true, broadcast: count });
       return;
     }
@@ -574,7 +568,6 @@ export function createServer(store: Store, opts?: {
           return { id: sid, name: agent?.name || undefined };
         }),
         joined: sessionId ? myRooms.has(r.name) : undefined,
-        notify: (sessionId && myRooms.has(r.name)) ? store.resolveNotifyLevel(sessionId, r.name) : undefined,
       };
     });
     res.json(result);
@@ -659,22 +652,6 @@ export function createServer(store: Store, opts?: {
     }
 
     res.status(400).json({ error: "Specify ?room=name or ?dm=agent&session_id=id" });
-  });
-
-  // ── POST /api/notify ──
-  app.post("/api/notify", (req, res) => {
-    const { session_id, room, level } = req.body;
-    if (!session_id || !level) {
-      res.status(400).json({ error: "session_id and level are required" });
-      return;
-    }
-    if (!["all", "mentions", "mute"].includes(level)) {
-      res.status(400).json({ error: "level must be 'all', 'mentions', or 'mute'" });
-      return;
-    }
-    const roomName = room ? (room as string).replace(/^#/, "") : null;
-    store.setNotifyPref(session_id, roomName, level);
-    res.json({ ok: true, session_id, room: roomName, level });
   });
 
   // ── POST /api/invite ──

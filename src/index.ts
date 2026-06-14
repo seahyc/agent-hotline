@@ -551,10 +551,12 @@ program
 // ── send ──
 program
   .command("send")
-  .description("Send a message to an agent, room (#name), or everyone (*)")
-  .argument("<to>", "Recipient: agent name/ID, #room, or * for broadcast")
+  .description("Send a message to an agent, room (#name), or everyone (* — requires --all)")
+  .argument("<to>", "Recipient: agent name/ID, #room, or * for broadcast (requires --all)")
   .argument("[message]", "Message content ('-' or omitted with --file/stdin)")
   .option("--file <path>", "Read message content from a file")
+  .option("--all", "Required to broadcast to every agent with *")
+  .option("--force", "Alias for --all")
   .option("--agent <name>", "Your agent name or session ID (auto-resolved if omitted)")
   .option("--server <url>", "Server URL")
   .option("--auth-key <key>", "Authentication key")
@@ -588,7 +590,7 @@ program
       const result = await fetchJson(`${serverUrl}/api/message`, {
         method: "POST",
         headers: authHeaders(key),
-        body: JSON.stringify({ from, to, content }),
+        body: JSON.stringify({ from, to, content, force: !!(opts.all || opts.force) }),
         timeoutMs: 20_000,
       }) as Record<string, unknown>;
 
@@ -755,7 +757,7 @@ program
 
     try {
       const rooms = await fetchJson(`${serverUrl}/api/rooms?${params}`, { headers: authHeaders(key) }) as Array<{
-        name: string; memberCount: number; joined?: boolean; notify?: string;
+        name: string; memberCount: number; joined?: boolean;
       }>;
 
       emit(opts.json, rooms, () => {
@@ -768,8 +770,7 @@ program
         console.log();
         for (const r of rooms) {
           const joined = r.joined ? `${GREEN}✓${RESET} ` : "  ";
-          const notify = r.notify && r.notify !== "all" ? ` ${DIM}[${r.notify}]${RESET}` : "";
-          console.log(`  ${joined}${CYAN}#${r.name}${RESET}  ${DIM}${r.memberCount} member(s)${RESET}${notify}`);
+          console.log(`  ${joined}${CYAN}#${r.name}${RESET}  ${DIM}${r.memberCount} member(s)${RESET}`);
         }
         console.log();
       });
@@ -881,39 +882,6 @@ program
           console.log(`  ${m.content}`);
           console.log();
         }
-      });
-    } catch (e) {
-      fail(e instanceof CliError ? e.message : String(e), opts);
-    }
-  });
-
-// ── notify ──
-program
-  .command("notify")
-  .description("Set notification preferences for a room or globally")
-  .argument("<level>", "Notification level: all, mentions, mute")
-  .option("--room <name>", "Room name (omit for global default)")
-  .option("--agent <id>", "Agent session ID (auto-resolved if omitted)")
-  .option("--server <url>", "Server URL")
-  .option("--auth-key <key>", "Authentication key")
-  .option("--json", "Machine-readable output")
-  .action(async (level, opts) => {
-    if (!["all", "mentions", "mute"].includes(level)) {
-      fail("invalid level. Use: all, mentions, mute", opts);
-    }
-    const sessionId = await requireIdentity(opts);
-    const serverUrl = getServerUrl(opts);
-    const key = getAuthKey(opts);
-
-    try {
-      const body = await fetchJson(`${serverUrl}/api/notify`, {
-        method: "POST",
-        headers: authHeaders(key),
-        body: JSON.stringify({ session_id: sessionId, room: opts.room, level }),
-      });
-      emit(opts.json, body, () => {
-        const label = body.room ? `#${body.room}` : "Global";
-        console.log(`${GREEN}${label} notifications: ${body.level}${RESET}`);
       });
     } catch (e) {
       fail(e instanceof CliError ? e.message : String(e), opts);

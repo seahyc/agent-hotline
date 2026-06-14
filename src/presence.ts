@@ -22,8 +22,11 @@ export function startPresenceLoop(
   intervalMs: number = DEFAULT_INTERVAL_MS,
   retentionDays?: number,
 ) {
-  let lastPurge = Date.now();
+  // Start at 0 so the first tick runs a one-time startup sweep, clearing the
+  // backlog of dead agent rows / orphan room members accumulated before purging.
+  let lastPurge = 0;
   const PURGE_INTERVAL_MS = 60 * 60 * 1000; // hourly
+  const STALE_AGENT_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
   const check = () => {
     const cutoff = Date.now() - OFFLINE_THRESHOLD_MS;
@@ -46,11 +49,23 @@ export function startPresenceLoop(
         store.markOffline(agent.session_id);
       }
     }
-    // Purge old messages periodically
-    if (retentionDays && Date.now() - lastPurge > PURGE_INTERVAL_MS) {
-      const deleted = store.purgeOldMessages(retentionDays);
-      if (deleted > 0) {
-        console.log(`Purged ${deleted} messages older than ${retentionDays} days`);
+    // Keep automatic directory-rooms in sync with the live cohort every tick,
+    // so cwd moves and departures reflect promptly (~30s) and idempotently.
+    store.reconcileAllAutoRooms();
+
+    // Purge old messages + stale agents/orphan members periodically (and once
+    // on startup, since lastPurge starts at 0).
+    if (Date.now() - lastPurge > PURGE_INTERVAL_MS) {
+      if (retentionDays) {
+        const deleted = store.purgeOldMessages(retentionDays);
+        if (deleted > 0) {
+          console.log(`Purged ${deleted} messages older than ${retentionDays} days`);
+        }
+      }
+      const staleAgents = store.purgeStaleAgents(STALE_AGENT_MAX_AGE_MS);
+      const orphanMembers = store.purgeOrphanRoomMembers();
+      if (staleAgents > 0 || orphanMembers > 0) {
+        console.log(`Purged ${staleAgents} stale agents and ${orphanMembers} orphan room members`);
       }
       lastPurge = Date.now();
     }

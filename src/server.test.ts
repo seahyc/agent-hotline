@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer } from "./server.js";
-import { createStore } from "./store.js";
+import { createStore, type Store } from "./store.js";
 import { unlinkSync } from "node:fs";
 import type { Server as HttpServer } from "node:http";
 
@@ -31,10 +31,11 @@ async function get(path: string, key?: string) {
 describe("server REST API", () => {
   let server: HttpServer;
   let masterKey: string;
+  let store: Store;
 
   beforeEach(async () => {
     cleanDb();
-    const store = createStore(TEST_DB);
+    store = createStore(TEST_DB);
     const result = createServer(store, { port: 0 });
     masterKey = result.masterKey;
     await new Promise<void>(resolve => {
@@ -110,15 +111,42 @@ describe("server REST API", () => {
       expect(msgs.some(m => m.content === "Hello!")).toBe(true);
     });
 
-    it("broadcasts to all agents", async () => {
+    it("rejects a bare broadcast without --all/force", async () => {
       await post("/api/heartbeat", { session_id: "broadcaster", pid: 1 });
       await post("/api/heartbeat", { session_id: "target-1", pid: 2 });
       await post("/api/heartbeat", { session_id: "target-2", pid: 3 });
 
       const res = await post("/api/message", { from: "broadcaster", to: "*", content: "All!" });
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error: string };
+      expect(body.error).toContain("needs --all");
+      // No inbox copy should have been delivered.
+      const inbox = await get("/api/inbox/target-1", masterKey);
+      const msgs = await inbox.json() as unknown[];
+      expect(msgs.length).toBe(0);
+    });
+
+    it("forced broadcast delivers to all online agents tagged 'broadcast'", async () => {
+      await post("/api/heartbeat", { session_id: "broadcaster", pid: 1 });
+      await post("/api/heartbeat", { session_id: "target-1", pid: 2 });
+      await post("/api/heartbeat", { session_id: "target-2", pid: 3 });
+
+      const res = await post("/api/message", { from: "broadcaster", to: "*", content: "All!", force: true });
       expect(res.status).toBe(200);
       const body = await res.json() as { ok: boolean; broadcast: number };
       expect(body.broadcast).toBe(2);
+
+      for (const target of ["target-1", "target-2"]) {
+        const inbox = await get(`/api/inbox/${target}`, masterKey);
+        const msgs = await inbox.json() as Array<{ content: string; msg_type: string }>;
+        expect(msgs.length).toBe(1);
+        expect(msgs[0].content).toBe("All!");
+        expect(msgs[0].msg_type).toBe("broadcast");
+      }
+      // Sender never receives its own broadcast.
+      const senderInbox = await get("/api/inbox/broadcaster", masterKey);
+      const senderMsgs = await senderInbox.json() as unknown[];
+      expect(senderMsgs.length).toBe(0);
     });
 
     it("delivers a room message", async () => {
@@ -273,61 +301,101 @@ describe("server REST API", () => {
     });
   });
 
-  // ── Notify ──
-  describe("POST /api/notify", () => {
-    it("sets room notification preference", async () => {
-      await post("/api/heartbeat", { session_id: "notif-agent", pid: 1 });
-      const res = await post("/api/notify", { session_id: "notif-agent", room: "general", level: "mentions" });
+  // ── Room delivery: history + @mention only ──
+  describe("room delivery (mention-only)", () => {
+    it("records history but pings nobody when there is no @mention", async () => {
+      await post("/api/heartbeat", { session_id: "quiet-sender", pid: 1 });
+      await post("/api/heartbeat", { session_id: "quiet-member", pid: 2 });
+      await post("/api/rooms/join", { session_id: "quiet-member", room: "quiet-room" });
+
+      const res = await post("/api/message", { from: "quiet-sender", to: "#quiet-room", content: "just chatter" });
       expect(res.status).toBe(200);
-      const body = await res.json() as { level: string; room: string };
-      expect(body.level).toBe("mentions");
-      expect(body.room).toBe("general");
+      const body = await res.json() as { notified: number };
+      expect(body.notified).toBe(0);
+
+      // Member gets no inbox push...
+      const inbox = await get("/api/inbox/quiet-member", masterKey);
+      const msgs = await inbox.json() as unknown[];
+      expect(msgs.length).toBe(0);
+
+      // ...but the message lives in room history.
+      const hist = await get("/api/messages?room=quiet-room");
+      const histMsgs = await hist.json() as Array<{ content: string }>;
+      expect(histMsgs.some(m => m.content === "just chatter")).toBe(true);
     });
 
-    it("sets global notification preference", async () => {
-      await post("/api/heartbeat", { session_id: "global-notif", pid: 1 });
-      const res = await post("/api/notify", { session_id: "global-notif", level: "mute" });
-      expect(res.status).toBe(200);
-    });
+    it("pings only the @mentioned agent, member or not", async () => {
+      await post("/api/heartbeat", { session_id: "mention-sender", pid: 1 });
+      await post("/api/heartbeat", { session_id: "mention-a", pid: 2 });
+      await post("/api/heartbeat", { session_id: "mention-b", pid: 3 });
+      await post("/api/rename", { session_id: "mention-a", name: "alice" });
+      await post("/api/rooms/join", { session_id: "mention-a", room: "ping-room" });
+      await post("/api/rooms/join", { session_id: "mention-b", room: "ping-room" });
 
-    it("rejects invalid level", async () => {
-      const res = await post("/api/notify", { session_id: "x", level: "invalid" });
-      expect(res.status).toBe(400);
+      const res = await post("/api/message", { from: "mention-sender", to: "#ping-room", content: "hey @alice look" });
+      expect(res.status).toBe(200);
+      const body = await res.json() as { notified: number };
+      expect(body.notified).toBe(1);
+
+      const inboxA = await get("/api/inbox/mention-a", masterKey);
+      const msgsA = await inboxA.json() as Array<{ content: string; msg_type: string }>;
+      expect(msgsA.length).toBe(1);
+      expect(msgsA[0].msg_type).toBe("mention");
+
+      // Non-mentioned member gets nothing.
+      const inboxB = await get("/api/inbox/mention-b", masterKey);
+      const msgsB = await inboxB.json() as unknown[];
+      expect(msgsB.length).toBe(0);
     });
   });
 
-  // ── Room fanout notification ──
-  describe("room fanout", () => {
-    it("muted member does not get inbox copy", async () => {
-      await post("/api/heartbeat", { session_id: "fanout-sender", pid: 1 });
-      await post("/api/heartbeat", { session_id: "fanout-muted", pid: 2 });
-      await post("/api/rooms/join", { session_id: "fanout-muted", room: "muted-room" });
-      await post("/api/notify", { session_id: "fanout-muted", room: "muted-room", level: "mute" });
-      await post("/api/message", { from: "fanout-sender", to: "#muted-room", content: "You won't see this" });
+  // ── Auto directory-rooms (reconciliation) ──
+  describe("auto directory-rooms", () => {
+    it("two agents sharing a chain key land in the same auto-room", async () => {
+      await post("/api/heartbeat", { session_id: "dir-a", pid: 1 });
+      await post("/api/heartbeat", { session_id: "dir-b", pid: 2 });
+      store.upsertAgent({ session_id: "dir-a", dir_chain: ["myrepo/src", "myrepo"] });
+      store.upsertAgent({ session_id: "dir-b", dir_chain: ["myrepo"] });
 
-      const inbox = await get("/api/inbox/fanout-muted", masterKey);
-      const msgs = await inbox.json() as unknown[];
-      expect(msgs.length).toBe(0);
+      store.reconcileAllAutoRooms();
+
+      // Shared key "myrepo" becomes a room both join; "myrepo/src" is unique to A.
+      expect(store.getAgentRooms("dir-a")).toContain("myrepo");
+      expect(store.getAgentRooms("dir-b")).toContain("myrepo");
+      expect(store.getAgentRooms("dir-a")).not.toContain("myrepo/src");
     });
 
-    it("mentions-only member gets inbox copy only when @mentioned", async () => {
-      await post("/api/heartbeat", { session_id: "fanout-mentioner", pid: 1 });
-      await post("/api/heartbeat", { session_id: "fanout-target", pid: 2 });
-      await post("/api/rooms/join", { session_id: "fanout-target", room: "mention-room" });
-      await post("/api/rename", { session_id: "fanout-target", name: "target-user" });
-      await post("/api/notify", { session_id: "fanout-target", room: "mention-room", level: "mentions" });
+    it("a chain key unique to one agent creates no room", async () => {
+      await post("/api/heartbeat", { session_id: "lonely", pid: 1 });
+      await post("/api/heartbeat", { session_id: "elsewhere", pid: 2 });
+      store.upsertAgent({ session_id: "lonely", dir_chain: ["soloproj"] });
+      store.upsertAgent({ session_id: "elsewhere", dir_chain: ["otherproj"] });
 
-      // Without mention
-      await post("/api/message", { from: "fanout-mentioner", to: "#mention-room", content: "No mention here" });
-      const inbox1 = await get("/api/inbox/fanout-target", masterKey);
-      const msgs1 = await inbox1.json() as unknown[];
-      expect(msgs1.length).toBe(0);
+      store.reconcileAllAutoRooms();
 
-      // With mention
-      await post("/api/message", { from: "fanout-mentioner", to: "#mention-room", content: "@target-user hello!" });
-      const inbox2 = await get("/api/inbox/fanout-target", masterKey);
-      const msgs2 = await inbox2.json() as unknown[];
-      expect(msgs2.length).toBe(1);
+      expect(store.getAgentRooms("lonely")).not.toContain("soloproj");
+    });
+
+    it("reconcile leaves a stale auto-room when the chain changes, keeps manual rooms", async () => {
+      await post("/api/heartbeat", { session_id: "mover", pid: 1 });
+      await post("/api/heartbeat", { session_id: "anchor", pid: 2 });
+      // Manual membership that reconcile must never touch.
+      await post("/api/rooms/join", { session_id: "mover", room: "manual-room" });
+
+      store.upsertAgent({ session_id: "mover", dir_chain: ["projX"] });
+      store.upsertAgent({ session_id: "anchor", dir_chain: ["projX"] });
+      store.reconcileAllAutoRooms();
+      expect(store.getAgentRooms("mover")).toContain("projX");
+
+      // Mover relocates: now shares projY with anchor instead.
+      store.upsertAgent({ session_id: "mover", dir_chain: ["projY"] });
+      store.upsertAgent({ session_id: "anchor", dir_chain: ["projY", "projX"] });
+      store.reconcileAllAutoRooms();
+
+      const rooms = store.getAgentRooms("mover");
+      expect(rooms).toContain("projY");
+      expect(rooms).not.toContain("projX"); // stale auto-room left
+      expect(rooms).toContain("manual-room"); // manual membership untouched
     });
   });
 
@@ -429,6 +497,8 @@ describe("server REST API", () => {
       await post("/api/rooms/join", { session_id: "agent-a", room: "deploys" }, masterKey);
       await post("/api/rooms/join", { session_id: "agent-b", room: "general" }, masterKey);
       await post("/api/rooms/join", { session_id: "agent-b", room: "deploys" }, masterKey);
+      // Room posts are quiet unless they @mention you — name agent-a so it can be pinged.
+      await post("/api/rename", { session_id: "agent-a", name: "filt-a" }, masterKey);
 
       const tokenRes = await post("/api/inbox-token", { session_id: "agent-a" }, masterKey);
       const { token } = await tokenRes.json() as { token: string };
@@ -440,10 +510,10 @@ describe("server REST API", () => {
       });
       await new Promise(r => setTimeout(r, 50));
 
-      // Send to #general (should arrive)
-      await post("/api/message", { from: "agent-b", to: "#general", content: "general msg" }, masterKey);
-      // Send to #deploys (should NOT arrive via SSE)
-      await post("/api/message", { from: "agent-b", to: "#deploys", content: "deploys msg" }, masterKey);
+      // Mention agent-a in #general (should arrive — mention carries room=general)
+      await post("/api/message", { from: "agent-b", to: "#general", content: "@filt-a general msg" }, masterKey);
+      // Mention agent-a in #deploys (should NOT arrive via the general-filtered SSE)
+      await post("/api/message", { from: "agent-b", to: "#deploys", content: "@filt-a deploys msg" }, masterKey);
 
       // Small delay to let SSE events flush
       await new Promise(r => setTimeout(r, 100));
@@ -471,8 +541,8 @@ describe("server REST API", () => {
       const messages = dataLines.map(l => JSON.parse(l.replace("data: ", "")));
 
       // Should have the general message but NOT the deploys message
-      expect(messages.some((m: { content: string }) => m.content === "general msg")).toBe(true);
-      expect(messages.some((m: { content: string }) => m.content === "deploys msg")).toBe(false);
+      expect(messages.some((m: { content: string }) => m.content.includes("general msg"))).toBe(true);
+      expect(messages.some((m: { content: string }) => m.content.includes("deploys msg"))).toBe(false);
     });
 
     it("delivers all messages when no rooms filter", async () => {
@@ -480,6 +550,8 @@ describe("server REST API", () => {
       await post("/api/heartbeat", { session_id: "agent-b", pid: process.pid });
       await post("/api/rooms/join", { session_id: "agent-a", room: "general" }, masterKey);
       await post("/api/rooms/join", { session_id: "agent-b", room: "general" }, masterKey);
+      // Room posts are quiet unless they @mention you — name agent-a so it can be pinged.
+      await post("/api/rename", { session_id: "agent-a", name: "all-a" }, masterKey);
 
       const tokenRes = await post("/api/inbox-token", { session_id: "agent-a" }, masterKey);
       const { token } = await tokenRes.json() as { token: string };
@@ -491,9 +563,9 @@ describe("server REST API", () => {
       });
       await new Promise(r => setTimeout(r, 50));
 
-      // Send a DM and a room message
+      // Send a DM and an @mention room message — both should arrive (no filter).
       await post("/api/message", { from: "agent-b", to: "agent-a", content: "dm msg" }, masterKey);
-      await post("/api/message", { from: "agent-b", to: "#general", content: "room msg" }, masterKey);
+      await post("/api/message", { from: "agent-b", to: "#general", content: "@all-a room msg" }, masterKey);
 
       await new Promise(r => setTimeout(r, 100));
 
@@ -517,8 +589,8 @@ describe("server REST API", () => {
       const dataLines = collected.split("\n").filter(l => l.startsWith("data: "));
       const messages = dataLines.map(l => JSON.parse(l.replace("data: ", "")));
 
-      expect(messages.some((m: { content: string }) => m.content === "dm msg")).toBe(true);
-      expect(messages.some((m: { content: string }) => m.content === "room msg")).toBe(true);
+      expect(messages.some((m: { content: string }) => m.content.includes("dm msg"))).toBe(true);
+      expect(messages.some((m: { content: string }) => m.content.includes("room msg"))).toBe(true);
     });
   });
 

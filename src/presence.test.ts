@@ -35,6 +35,10 @@ function mockStore(agents: Agent[]): Store {
     markRead: vi.fn(),
     markOffline: vi.fn(),
     getOnlineAgents: vi.fn(() => agents),
+    reconcileAllAutoRooms: vi.fn(),
+    purgeStaleAgents: vi.fn(() => 0),
+    purgeOrphanRoomMembers: vi.fn(() => 0),
+    purgeOldMessages: vi.fn(() => 0),
   } as unknown as Store;
 }
 

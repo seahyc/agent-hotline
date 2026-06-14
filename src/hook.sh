@@ -124,11 +124,15 @@ case "$EVENT" in
     if [ "$STOP_ACTIVE" = "true" ]; then
       exit 0
     fi
-    MSGS=$(hotline_curl -sf --connect-timeout 0.2 --max-time 1 "$SERVER/api/inbox/$HOOK_SESSION" 2>/dev/null) || exit 0
-    if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ]; then
+    # Peek at inbox without consuming (mark_read=false): only re-engage for messages
+    # actually addressed to us — DMs (direct) and @mentions. Non-mention room chatter
+    # and broadcasts never block idle.
+    MSGS=$(hotline_curl -sf --connect-timeout 0.2 --max-time 1 "$SERVER/api/inbox/$HOOK_SESSION?mark_read=false" 2>/dev/null) || exit 0
+    BLOCKING=$(echo "$MSGS" | jq -c '[.[] | select(.msg_type == "direct" or .msg_type == "mention")]' 2>/dev/null)
+    if [ -n "$BLOCKING" ] && [ "$BLOCKING" != "[]" ]; then
       {
         echo "Agent Hotline messages arrived while you were working. Handle them now (reply with: agent-hotline send <agent> \"...\"):"
-        echo "$MSGS" | jq -r '.[] | "[\(.from_agent)] \(.content)"' 2>/dev/null
+        echo "$BLOCKING" | jq -r '.[] | "[\(.from_agent)] \(.content)"' 2>/dev/null
       } >&2
       exit 2
     fi
